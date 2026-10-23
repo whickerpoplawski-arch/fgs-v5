@@ -1,0 +1,21 @@
+# FGS 黑板插件（Host 半 + Client 半由 dsh.client 自动装载）
+- insert:
+    - id: fgs-v5
+      name: '@local/fgs-v5-dsh'
+      config:
+        stateDir: .fgs
+        # regex = 只校验 fact 文本里出现过 flag 形态；真正比赛建议改用 command：
+        # verifyMode: command
+        # verifyCommand: 'node ./tools/submit_flag.mjs'   # 相对本插件目录；也可写任意绝对路径
+        #   （把证据写到 stdin，脚本调赛方提交接口，退出码 0 = 过；409 重复提交也按过）
+        # 单题 Execute 墙钟（毫秒）。到期写未完成 Fact 并释放认领，不关 step。
+        # 与 stepLeaseMs（认领租约，默认 30min，代码默认）不是一回事。
+        # 注意：活动模式（v5）下进程内 TTL 不生效，墙钟由编排器的 --activity-timeout-sec 管。
+        executeSessionTtlMs: 600000
+        verifyMode: regex
+        # 真实竞赛（百度）用小写 flag{...}：pattern 按小写写，靠 flagFlags: i 同时兼容 FLAG{...}
+        flagPattern: 'flag\{[^}\s]{4,}\}'
+        flagFlags: i
+        # v5 活动模式：off = 单会话按图切角色（本文件默认）。
+        # 竞赛镜像不需要在这里改：编排器用 FGS_ACTIVITY/FGS_STEP 环境变量注入每个 run 的活动。
+        activity: 'off'

@@ -1,0 +1,44 @@
+# Execute 工具 I/O 预制规范（CONTRACT §9）
+#
+# 环境工具由宿主（DSH）提供：bash / read / write / edit / glob / grep 等，
+# 参数形态以宿主 schema 为准；本插件只注册图工具并做角色隔离。
+role: execute
+tools:
+  - fgs_project
+  - fgs_status
+  - fgs_submit_fact
+  - fgs_commit_step
+  # v2（Cairn_Y）：图操作工具两类活动都放行，Execute 下同样可用。
+  - fgs_preview
+  - fgs_open_step
+  - fgs_claim_step
+  - fgs_drop_step
+  - fgs_change_step_priority
+  - fgs_add_subgoal
+  - fgs_drop_subgoal
+  - fgs_commit
+  - bash
+  - read
+  - write
+  - edit
+  - glob
+  - grep
+forbidden_tools:
+  # 由 tools.guard 在 dispatch 层硬拒（本插件不做 schema 隐藏）。
+  #
+  # ⚠️ 这里只能列 **goal 级判断**。v2 起「图操作工具」在两类活动都放行
+  # （唯一真源：index.js 的 GRAPH_MUTATION_TOOLS，派生常量 EXECUTE_DENIED_GRAPH_TOOLS），
+  # 所以**不得**再列 fgs_open_step / fgs_drop_step / fgs_change_step_priority / fgs_commit：
+  # 实测教训 —— 一旦列上，提示词就与 guard 打架（guard 放行、提示词说会被拒），
+  # 模型会因此**自我审查**、明明可用也不敢用，「图不僵死」在执行侧直接落空。
+  - fgs_satisfy_goal
+  - fgs_reopen
+filter:
+  # env 工具 stdout/stderr 截断后进模型（噪声裁剪）
+  max_output_chars: 32000
+  truncate_marker: "…(truncated, see file)"
+notes:
+  - 一轮只吃一个 open step（取优先级最高的那个）
+  - 必须以一条新 Fact 收束；无 submit 也强制观察 Fact
+  - submit_fact title ≤ 120 字；content 超 8KiB 须是文件路径
+  - producedBy 指向的 step 必须是 open

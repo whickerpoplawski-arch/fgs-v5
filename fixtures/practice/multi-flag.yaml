@@ -1,0 +1,16 @@
+facts:
+- id: fact_origin
+  title: "题目信息:"
+  createdAt: 2026-10-14T12:00:00.000Z
+  content: |-
+    {
+      "unique_code": "practice-multi",
+      "markers": ["flag{practice-marker-a}", "flag{practice-marker-b}"],
+      "done_when": "两个标记都出现在事实正文里，缺一不算完成"
+    }
+goals:
+- id: goal_final
+  kind: final
+  criterion: 两个标记都必须出现在事实中才算完成：flag{practice-marker-a} 与 flag{practice-marker-b}。缺一不算完成
+  createdAt: 2026-10-14T12:00:00.000Z
+steps: []

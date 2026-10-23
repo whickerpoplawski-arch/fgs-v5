@@ -1,0 +1,1471 @@
+--- a/index.js
++++ b/index.js
+@@ -21,7 +21,10 @@
+ } from './controller/index.js';
+ import { ProjectRegistry } from './controller/projects.js';
+ import {
++  addSubGoalOp,
+   changePriorityOp,
++  claimStepOp,
++  dropSubGoalOp,
+   dropStepOp,
+   openStepOp,
+   reopenOp,
+@@ -66,7 +69,10 @@
+ const PROJECT_TOOLS = ['fgs_project'];
+ const DECIDE_TOOLS = [
+   'fgs_open_step',
++  'fgs_claim_step',
+   'fgs_drop_step',
++  'fgs_add_subgoal',
++  'fgs_drop_subgoal',
+   'fgs_change_step_priority',
+   'fgs_preview',
+   'fgs_commit',
+@@ -74,6 +80,27 @@
+   'fgs_reopen',
+ ];
+ const EXECUTE_TOOLS = ['fgs_submit_fact', 'fgs_commit_step'];
++
++/**
++ * v2（Cairn_Y）：Decide 的职责是「在一个任务开始时，或者图上信息有增加或者变化时」
++ * **对 Step 做添加 / 废弃 / 优先级调整**，并「提出和删除 Sub Goal」——这些事情
++ * 必然发生在**有 open step 的时候**。所以这些「操作 FGS 图」的工具不能只在 Decide 放行，
++ * 否则会话一旦持有 step 就再也不能补规划，图会僵死。
++ *
++ * 它们只动**共享记忆（FGS 图）**，不动世界状态；真正需要物理隔离的是 §4：
++ * **没有派发到 Step 的会话，不得使用环境执行工具**（bash/write/web/委派…）。
++ * Decide 独占保留 goal 级判断：satisfy_goal / reopen。
++ */
++const GRAPH_MUTATION_TOOLS = [
++  'fgs_open_step',
++  'fgs_claim_step',
++  'fgs_drop_step',
++  'fgs_change_step_priority',
++  'fgs_add_subgoal',
++  'fgs_drop_subgoal',
++  'fgs_commit',
++  'fgs_preview',
++];
+ const GRAPH_TOOL_NAMES = [...CONTROL_TOOLS, ...DECIDE_TOOLS, ...EXECUTE_TOOLS];
+ 
+ /** 角色可见 toolset（CONTRACT §4、§5）。 */
+@@ -132,6 +159,14 @@
+   maxResultChars: 8_000,
+   exposeHttpState: true,
+   httpPath: '/fgs/state',
++  // Cairn《无径之径》§系统架构：「Intent 认领有心跳超时与自动释放」。
++  // stepLeaseMs = 认领租约；超期即视为可被**其他**会话重新认领（自动释放）。
++  // stepDraftTtlMs = 未收束草稿的存活上限；超期在 refreshRole 时清理，防僵尸草稿。
++  stepLeaseMs: 30 * 60 * 1000,
++  stepDraftTtlMs: 60 * 60 * 1000,
++  // v2：Finding = 搜索过程的结构化产物；类型**可动态定义**。
++  // 留空数组 = 不限制取值（自由定义）；给定 = 白名单。
++  findingTypes: [],
+ });
+ 
+ const PRIORITY_ORDER = { high: 0, normal: 1, low: 2 };
+@@ -145,13 +180,20 @@
+   '磁盘上已种题的 Project 会被自动认领（重启/换会话后不用重新种题）；没有活动 Project 时不能改图。',
+   '',
+   '角色由图的 open step 自动决定，工具集随之切换（越权调用在 dispatch 层被硬拒）：',
+-  '- 无 open step → Decide：只做规划/改图。除规划类工具与少量元工具外一律被拒，',
++  '- 本会话没有可分派/可认领的 open step → Decide：只做规划/改图。除规划类工具与少量元工具外一律被拒，',
+   '  包括 bash/read/write/edit/glob/grep 以及 web_fetch/web_search/subagent/workflow。',
+   '  用 fgs_open_step / fgs_drop_step / fgs_change_step_priority / fgs_satisfy_goal / fgs_reopen 记草稿，',
+   '  最后用 fgs_commit 一次性提交（草稿为空时 commit 可传 operations[] 批量）。',
+-  '- 有 open step → Execute：一轮只推进一个 open step，用 fgs_submit_fact 落新 Fact，',
++  '- 本会话持有（或认领到）一个 open step → Execute：一轮只推进一个 open step，用 fgs_submit_fact 落新 Fact，',
+   '  再用 fgs_commit_step 收束；无产出也必须落一条显式失败/观察 Fact。',
+   '',
++  '任务派发（Cairn 语义）：step 由「开它的会话」持有（owner）；未认领或租约过期的 step 可被任何会话认领。',
++  '一个会话绝不去收束别的会话持有的 step —— 这正是「黑板因果链错位」的根因，已在协议层拒写。',
++  '',
++  'v2 Cairn_Y 语义：FGS 图 = Fact（当前世界状态）/ Goal（搜索的终止条件，**含可动态增删的 Sub Goal**）',
++  '  / Step（如何从已有事实产生新事实的因果过程）；**图只追加**（删除即标记 dropped，不删历史）。',
++  'Finding = 搜索过程的结构化产物（渗透/代码审计类任务里就是漏洞）：用 fgs_submit_fact 的 findingType 标记。',
++  '',
+   '硬约束：',
+   '- open_step 必须给 from（存在的 fact id）；step.from 为空直接拒写。',
+   '- drop_step 必须给 reason；satisfy_goal 必须给 {goalId, reason, satisfiedBy}，缺一拒收。',
+@@ -379,7 +421,13 @@
+   const root = registry.projectRoot(problemId);
+   fs.mkdirSync(path.join(root, 'workspace'), { recursive: true });
+   const store = new GraphStore(root, cfg);
+-  const controller = new Controller(store, { verifyHook: makeVerifyHook(cfg) });
++  const controller = new Controller(store, {
++    verifyHook: makeVerifyHook(cfg),
++    // 认领时的租约检查：被别的会话在租约内持有的 step 不得抢写。
++    claimOptions: { leaseMs: cfg.stepLeaseMs ?? 0 },
++    // v2「Finding 可以动态定义」：留空 = 自由定义；给定则限定取值。
++    findingTypes: cfg.findingTypes ?? [],
++  });
+   return {
+     sid: sessionIdOf(agent),
+     problemId,
+@@ -388,9 +436,11 @@
+     workspaceDir: path.join(root, 'workspace'),
+     store,
+     controller,
++    cfg,
+     role: 'decide',
+     decideDraft: [],
+     execDraft: null,
++    execDraftAt: null,
+     currentStepId: null,
+     reachable: false,
+     touchedAt: Date.now(),
+@@ -570,17 +620,94 @@
+   return Boolean(goal?.satisfiedAt);
+ }
+ 
+-/** 角色由图状态推导：有 open step → execute，否则 decide。 */
++function stepOwnerOf(step) {
++  return step?.owner ?? null;
++}
++
++/** 该 step 是否仍被某个会话在租约内持有。 */
++function claimFresh(step, now, leaseMs) {
++  if (!stepOwnerOf(step)) return false;
++  if (!(leaseMs > 0)) return true; // 租约关闭 ⇒ 视为一直持有
++  const t = Date.parse(step?.claimedAt ?? '');
++  if (!Number.isFinite(t)) return false;
++  return now - t < leaseMs;
++}
++
++/**
++ * 任务派发（Cairn《无径之径》§系统架构 / §Agent 间协调）：
++ * 「Dispatcher 是协议的唯一写入者」「Intent 认领有心跳超时与自动释放」
++ * 「Worker 没有身份，只有任务。任务从图里来，不从角色定义里来。」
++ *
++ * 本会话可分派的任务优先级：**自己已认领的 open step** > **未认领 / 租约已过期的 open step**。
++ * 图上有 open step 但全部被其他会话在租约内持有时，本会话**没有任务** ⇒ 退回 Decide
++ * （它可以去规划新 step，而不是被锁死在一个不属于它的 step 上）。
++ */
++function pickDispatchable(graph, sid, leaseMs, now = Date.now()) {
++  const open = openStepsOf(graph);
++  const mine = open.filter((s) => stepOwnerOf(s) === sid);
++  if (mine.length) return { step: mine[0], kind: 'owned' };
++  const free = open.filter((s) => !claimFresh(s, now, leaseMs));
++  if (free.length) return { step: free[0], kind: 'claim' };
++  return { step: null, kind: open.length > 0 ? 'held-by-others' : 'none' };
++}
++
++/** 认领一个 open step（写图，Controller 校验租约）。 */
++function claimStep(run, graph, stepId) {
++  const next = run.controller.apply(claimStepOp({ stepId, owner: run.sid }), graph);
++  run.controller.commit(next);
++  return next;
++}
++
++/**
++ * 僵尸草稿回收：草稿是「跨回合保留」的（见 fgs_commit_step 的提示），
++ * 但会话一旦结束就再也没人来收束它 —— 实测会留下永久僵尸草稿。
++ * 这里按 stepDraftTtlMs 兜底清理，并在 run 上记 draftExpired 供面板显示。
++ */
++function expireStaleDraft(run, cfg) {
++  if (!run.execDraft) return false;
++  const ttl = cfg.stepDraftTtlMs ?? 0;
++  if (!(ttl > 0)) return false;
++  const at = run.execDraftAt ?? 0;
++  if (at && Date.now() - at < ttl) return false;
++  run.execDraft = null;
++  run.execDraftAt = null;
++  run.draftExpired = true;
++  return true;
++}
++
++/**
++ * 角色 = f(图, 本会话)：**每轮重算，绝不缓存**。
++ *
++ * 旧实现在开 step 时把 run.role 定成 execute 之后就再没重算过；当该 step 被
++ * **别的会话**收束（多代理拓扑下必然发生）时，这个会话就永久卡在 Execute：
++ * fgs_open_step 被角色门拒绝（进不去）、fgs_submit_fact 因没有 open step 被拒（出不来）
++ * —— 不可自愈死锁；同时因为不是 decide，§4「Decide 禁止环境工具」也就形同虚设。
++ * 现在改为每次都由 (图, sid) 现算，并从图上认领任务，两个问题一并消除。
++ */
+ function refreshRole(run) {
++  const cfg = run.cfg ?? DEFAULT_CONFIG;
++  const leaseMs = cfg.stepLeaseMs ?? 0;
+   const graph = run.store.load();
+-  run.role = openStepsOf(graph).length > 0 ? 'execute' : 'decide';
+-  if (run.role === 'execute') {
+-    if (!run.currentStepId || !openStepsOf(graph).some((s) => s.id === run.currentStepId)) {
+-      run.currentStepId = openStepsOf(graph)[0]?.id ?? null;
+-    }
+-  } else {
+-    run.currentStepId = null;
+-  }
++  expireStaleDraft(run, cfg);
++  const open = openStepsOf(graph);
++  const mine = open.filter((s) => stepOwnerOf(s) === run.sid);
++  if (mine.length > 0) {
++    run.role = 'execute';
++    run.currentStepId = mine[0].id;
++    run.dispatch = 'owned';
++    return graph;
++  }
++  // v2 关键：**没有派发给我的 Step 就是 Decide**，而不是「图上有 open step 就是 Execute」。
++  // v2 说 Decide「在一个任务开始时，或者图上信息有增加或者变化时被触发」—— 也就是说
++  // Decide 必须能在**有 open step 的情况下**照常运行（否则 Sub Goal / Step 增删这些
++  // 「操作 FGS 图」的职责就永远没人能做，图会僵死）。
++  // 认领（claim）**不再隐式发生**：接手别人的 Step 走显式的 fgs_claim_step，
++  // 这样 Step↔Run 的绑定永远是一次可审计的显式派发（v1 Dispatcher 语义在这儿落地）。
++  run.role = 'decide';
++  run.currentStepId = null;
++  const now = Date.now();
++  run.dispatch = open.length === 0 ? 'none'
++    : open.some((s) => !claimFresh(s, now, leaseMs)) ? 'claimable' : 'held-by-others';
+   return graph;
+ }
+ 
+@@ -663,9 +790,15 @@
+ function graphSnapshot(run) {
+   const graph = run.store.load();
+   const open = openStepsOf(graph);
+-  // 角色一律从「图」推导（≥1 个 open step ⇒ Execute，否则 Decide），不报内存缓存值：
+-  // 图被外部改动/删除时缓存会和图对不上，面板就会出现 execute + 0 steps 这种自相矛盾状态。
+-  const role = derivedRole(graph);
++  // 保留「图视角」的全局角色（≥1 个 open step ⇒ Execute），仅作对照，不驱动行为。
++  const globalRole = derivedRole(graph);
++  // 「本会话视角」：只认分派给本会话的任务。**只读、不认领**（面板会遍历所有会话查询，
++  // 若在这里认领会替别的会话抢任务）。
++  const cfg = run.cfg ?? DEFAULT_CONFIG;
++  const leaseMs = cfg.stepLeaseMs ?? 0;
++  const ownedStep = open.find((s) => stepOwnerOf(s) === run.sid) ?? null;
++  const dispatch = pickDispatchable(graph, run.sid, leaseMs);
++  const role = ownedStep ? 'execute' : 'decide';
+   // 空图 = 本会话还没种题（或图文件被外部删除）：按「未启动」上报，
+   // 让 Client 走它自己的「未启动」分支，而不是渲染成一条矛盾的黑板条。
+   if (graph.facts.length === 0 && graph.goals.length === 0 && graph.steps.length === 0) {
+@@ -682,15 +815,28 @@
+     roundSeq: run.roundSeq ?? 0,
+     role,
+     roleLabel: roleLabel(role),
++    // 观测面自证（原 D6）：把两个来源都亮出来，不一致时一眼可见。
++    derivedRole: globalRole,
++    roleDiverged: globalRole !== role,
++    dispatch: dispatch.kind, // owned | claim | held-by-others | none
+     reachable: run.reachable,
+     satisfied: goalSatisfied(graph),
+     currentStepId: run.currentStepId,
++    ownedStepId: ownedStep?.id ?? null,
+     draft: draftSummary(run),
++    draftExpired: Boolean(run.draftExpired),
++    subGoals: (graph.goals ?? []).filter((g) => g.kind === 'sub').map((g) => ({
++      id: g.id, criterion: g.criterion, state: g.state ?? 'open', parentId: g.parentId ?? null,
++    })),
++    findings: (graph.facts ?? []).filter((f) => f.findingType)
++      .map((f) => ({ id: f.id, title: f.title, findingType: f.findingType })),
+     counts: {
+       facts: graph.facts.length,
+       goals: graph.goals.length,
+       steps: graph.steps.length,
+       open: open.length,
++      openOwnedByMe: open.filter((s) => stepOwnerOf(s) === run.sid).length,
++      openUnclaimed: open.filter((s) => !stepOwnerOf(s)).length,
+     },
+     facts: graph.facts.map((f) => ({ id: f.id, title: f.title })),
+     goals: graph.goals.map((g) => ({
+@@ -813,7 +959,15 @@
+     toolName: 'fgs_status',
+     description: '只读查看 FGS 黑板状态：角色、目标是否满足、facts/steps 计数与 open steps。',
+     parameters: { type: 'object', properties: {}, additionalProperties: false },
+-    run: (_args, exec) => {
++    run: (args, exec) => {
++      // 契约外的参数一律显式报错。宿主不一定执行 JSON Schema 校验（实测中
++      // {"action":"bad ref probe","from":["fact_999"]} 之类的垃圾入参被静默吞掉，
++      // 模型便以为 fgs_status 能做查询，连续轮询同一个计数摘要，白白烧轮次）。
++      const unknown = Object.keys(args ?? {});
++      if (unknown.length > 0) {
++        return fail(`fgs_status 不接受任何参数（收到: ${unknown.join(', ')}）。\n`
++          + '它只返回计数摘要；要看图请用 fgs_preview（Decide 轮只读投影）。');
++      }
+       // 认领（attach）：磁盘已种题的 Project 直接建 run + refreshRole，
+       // 不看「内存里有没有 run」——否则重启/换会话后会误报「尚未种题」。
+       const { problemId, run, reason } = attachRun(exec?.agent, cfg, runs, registries, detached);
+@@ -831,20 +985,39 @@
+       if (graph.facts.length === 0 && graph.goals.length === 0 && graph.steps.length === 0) {
+         return ok('FGS 未启动（图为空：尚未种题，或图文件已被移除）。');
+       }
+-      const role = derivedRole(graph);
++      // v2：Decide/Execute 是「独立运行过程」；这里给**本会话视角**（只读、不认领），
++      // 并同时亮出「图视角」，两者不一致时一眼可见（原 D6 四面矛盾）。
++      const owned = openStepsOf(graph).find((s) => stepOwnerOf(s) === run.sid) ?? null;
++      const role = owned ? 'execute' : 'decide';
++      const dispatch = pickDispatchable(graph, run.sid, cfg.stepLeaseMs ?? 0);
+       const lines = [
+         `Project: ${run.problemId}`,
+-        `角色: ${roleLabel(role)}`,
++        `角色: ${roleLabel(role)}`
++          + (derivedRole(graph) !== role ? `（图视角=${roleLabel(derivedRole(graph))}；dispatch=${dispatch.kind}）` : ''),
+         `图: ${path.join(run.root, 'graph.yaml')}`,
+         `workspace: ${run.workspaceDir}`,
+         `goal_final satisfied: ${goalSatisfied(graph) ? 'yes' : 'no'}`,
+-        `facts=${graph.facts.length} steps=${graph.steps.length} open=${openStepsOf(graph).length}`,
++        `facts=${graph.facts.length} goals=${graph.goals.length} steps=${graph.steps.length} open=${openStepsOf(graph).length}`,
++        `findings=${(graph.facts ?? []).filter((f) => f.findingType).length}`
++          + ` subgoals=${(graph.goals ?? []).filter((g) => g.kind === 'sub' && g.state !== 'dropped').length}`,
+       ];
++      for (const g of (graph.goals ?? []).filter((x) => x.kind === 'sub')) {
++        lines.push(`  subgoal ${g.id} [${g.state}] ${g.criterion}`);
++      }
++      for (const f of (graph.facts ?? []).filter((x) => x.findingType)) {
++        lines.push(`  finding ${f.id} [${f.findingType}] ${f.title}`);
++      }
+       for (const step of openStepsOf(graph)) {
+-        lines.push(`  open ${step.id} [${step.priority}] ${step.action}`);
++        // v2：Execute 是「被派发去推进某个 Step」。谁在推进、租约是否过期，必须可见。
++        const owner = stepOwnerOf(step);
++        const tag = !owner ? 'unclaimed'
++          : owner === run.sid ? 'mine'
++            : `held-by=${owner}${claimFresh(step, Date.now(), cfg.stepLeaseMs ?? 0) ? '' : ' (租约已过期,可接手)'}`;
++        lines.push(`  open ${step.id} [${step.priority}] (${tag}) ${step.action}`);
+       }
+       const draft = draftSummary(run);
+       if (draft) lines.push(`草稿: ${draft}`);
++      if (run.draftExpired) lines.push('⚠️ 上一条未收束的草稿已按 stepDraftTtlMs 过期回收。');
+       return ok(lines.join('\n'));
+     },
+   }));
+@@ -951,6 +1124,83 @@
+     },
+   }));
+ 
++  // v2 Cairn_Y：「Goal 描述项目的完成条件，即搜索的终止条件。**也存在可以动态增删的 Sub Goal**。」
++  // Sub Goal 的增删属于「操作 FGS 图」，因此归 Decide。
++  register(makeTool({
++    toolName: 'fgs_add_subgoal',
++    description: '新增一个 Sub Goal（v2：Goal 是搜索的终止条件，Sub Goal 可动态增删）。'
++      + ' Sub Goal 用来把长任务分阶段平稳推进；只追加，不改动既有 goal。',
++    parameters: {
++      type: 'object',
++      properties: {
++        criterion: { type: 'string', description: '这个 Sub Goal 的达成标准（不能为空）。' },
++        parentId: { type: 'string', description: '可选，父 goal，默认 goal_final。' },
++        goalId: { type: 'string', description: '可选，预分配 id（须形如 goal_xxx）。' },
++        reason: { type: 'string', description: '可选，为什么要开这个 Sub Goal。' },
++      },
++      required: ['criterion'],
++      additionalProperties: false,
++    },
++    run: (args, exec) => {
++      const run = active(exec);
++      return stageDecideOp(run, addSubGoalOp({
++        criterion: args.criterion,
++        parentId: args.parentId || 'goal_final',
++        goalId: args.goalId || null,
++        reason: args.reason || null,
++      }));
++    },
++  }));
++
++  register(makeTool({
++    toolName: 'fgs_drop_subgoal',
++    description: '废弃一个 Sub Goal（v2：可动态增删）。图只追加 —— 标记 dropped 并记 reason，历史不删除。必须给 reason。',
++    parameters: {
++      type: 'object',
++      properties: {
++        goalId: { type: 'string', description: '要废弃的 Sub Goal id。' },
++        reason: { type: 'string', description: '废弃原因，不能为空。' },
++      },
++      required: ['goalId', 'reason'],
++      additionalProperties: false,
++    },
++    run: (args, exec) => {
++      const run = active(exec);
++      return stageDecideOp(run, dropSubGoalOp({ goalId: args.goalId, reason: args.reason }));
++    },
++  }));
++
++  // v2：Step↔Run 的绑定必须是**显式派发**。接手一个未认领 / 租约过期的 step
++  // （例如原持有者已经结束）要走这个工具，而不是靠「谁先看到谁执行」。
++  register(makeTool({
++    toolName: 'fgs_claim_step',
++    description: '把一个未认领 / 租约已过期的 open step 认领给本会话（之后本会话进入 Execute）。'
++      + '- 接手指派用；认领会把 owner 写进图，必须显式调用。',
++    parameters: {
++      type: 'object',
++      properties: {
++        stepId: { type: 'string', description: '要接手的 open step id。' },
++      },
++      required: ['stepId'],
++      additionalProperties: false,
++    },
++    run: (args, exec) => {
++      const run = active(exec);
++      const graph = run.store.load();
++      const step = openStepsOf(graph).find((s) => s.id === args.stepId);
++      if (!step) return fail(`step ${args.stepId} 不是 open step，无法认领。`);
++      try {
++        const next = run.controller.apply(claimStepOp({ stepId: args.stepId, owner: run.sid }), graph);
++        run.controller.commit(next);
++      } catch (error) {
++        if (error?.name === 'WriteRejected') return fail(`claim_step 拒收: ${error.message}`);
++        throw error;
++      }
++      refreshRole(run);
++      return ok(`已认领 ${args.stepId}（owner=${run.sid}）。当前角色: ${roleLabel(run.role)}`);
++    },
++  }));
++
+   register(makeTool({
+     toolName: 'fgs_change_step_priority',
+     description: '在草稿里调整一个 open step 的优先级。',
+@@ -1095,6 +1345,16 @@
+           run.stepsOpenedRound = round;
+           run.stepsOpenedIds = new Set(openedNow);
+         }
++        // v2：Decide 产出 Step 之后必须有人去推进它 —— 本会话就是被派发的那个 Execute run，
++        // 因此把本回合新开的 step **显式认领给自己**。这样 Step↔Run 的绑定永远是一条
++        // 可审计的边（写进图里的 owner），而不是「谁先看到谁执行」的竞态。
++        for (const sid of openedNow) {
++          try {
++            working = claimStep(run, working, sid);
++          } catch {
++            /* 已被别处认领：留给持有者，或等租约过期后用 fgs_claim_step 接手 */
++          }
++        }
+       }
+       syncProjectMeta(registryFor(exec?.agent, cfg, registries), run, working);
+       refreshRole(run);
+@@ -1114,13 +1374,19 @@
+ 
+   register(makeTool({
+     toolName: 'fgs_submit_fact',
+-    description: '为当前 open step 落一条新 Fact（蒸馏：title≤120 字，content 超 8KiB 必须是产物文件路径）。',
++    description: '为当前 open step 落一条新 Fact（蒸馏：title≤120 字，content 超 8KiB 必须是产物文件路径）。'
++      + ' 可选 findingType：把这条 Fact 标记为 Finding（搜索过程的结构化产物，v2 Cairn_Y），'
++      + ' 例如 vuln / misconfig / cred / info；不填就是普通的中间事实。',
+     parameters: {
+       type: 'object',
+       properties: {
+         title: { type: 'string', description: '一句话结论（≤120 字）。' },
+         content: { type: 'string', description: '证据/细节；过长就写产物文件路径。' },
+         stepId: { type: 'string', description: '可选，覆盖本轮 step（默认当前 open step）。' },
++        findingType: {
++          type: 'string',
++          description: '可选。标记为 Finding 的类型（如 vuln）；类型可动态定义。',
++        },
+       },
+       required: ['title'],
+       additionalProperties: false,
+@@ -1142,7 +1408,18 @@
+         if (error instanceof WriteRejected) return fail(`submit_fact 拒收: ${error.message}`);
+         throw error;
+       }
+-      run.execDraft = { title, content, stepId: step.id };
++      const findingType = args.findingType ?? null;
++      if (findingType !== null) {
++        if (!String(findingType).trim()) return fail('findingType 不得为空白（要么不写，要么写类型）。');
++        if (String(findingType).length > 64) return fail('findingType 过长（>64）。');
++        const allowed = cfg.findingTypes ?? [];
++        if (allowed.length > 0 && !allowed.includes(findingType)) {
++          return fail(`findingType 非法: ${findingType}（当前允许: ${allowed.join(', ')}）。`
++            + ' Finding 的类型可动态定义 —— 改 config.findingTypes 即可扩展。');
++        }
++      }
++      run.execDraft = { title, content, stepId: step.id, findingType };
++      run.execDraftAt = Date.now();
+       return ok(`已记入本轮草稿: producedBy=${step.id}。结束时调用 fgs_commit_step 收束。`);
+     },
+   }));
+@@ -1161,9 +1438,20 @@
+     run: (args, exec) => {
+       const run = active(exec);
+       const { round, limited } = observeRound(run, turnOf(ctx, exec?.agent));
++      const graph = run.store.load();
++      const resolved = resolveRoundStep(run, graph, args.stepId ?? run.execDraft?.stepId);
++      if (resolved.error) return fail(resolved.error);
++      const step = resolved.step;
++      // 「本回合刚由本会话打开」的 step 允许在本回合收束。
++      // 旧实现一律拒绝，导致「先收束上个 step、再开新 step 并想立刻执行」的正常流程
++      // 把新 step 留成**孤儿 open step**，并留下一条永久僵尸草稿（实测 D3）。
++      const selfOpenedThisRound = limited
++        && run.stepsOpenedRound === round
++        && run.stepsOpenedIds instanceof Set
++        && run.stepsOpenedIds.has(step.id);
+       // CONTRACT §5：一轮只吃一个 open step。判据是本 Project run 的 roundSeq，
+       // 不用全局 turn 数字，避免同会话多题互相误拦（G8）。
+-      if (limited && run.lastCommitRound === round) {
++      if (limited && run.lastCommitRound === round && !selfOpenedThisRound) {
+         return fail('一轮只吃一个 open step（CONTRACT §5）：本回合已经收束过 step 了。\n'
+           + '⚠️ **继续在本回合硬推下一个 step 是记不进黑板的** —— 本回合后续所有 '
+           + 'fgs_commit_step 都会被拒，你这一段的发现会全部丢失（实测过：多 flag 题的'
+@@ -1173,10 +1461,6 @@
+           + '  b) 如果手里还有未落盘的发现，先用 fgs_submit_fact 把它写成草稿（草稿会跨回合保留），\n'
+           + '     下一回合开头直接 fgs_commit_step 即可落盘。');
+       }
+-      const graph = run.store.load();
+-      const resolved = resolveRoundStep(run, graph, args.stepId ?? run.execDraft?.stepId);
+-      if (resolved.error) return fail(resolved.error);
+-      const step = resolved.step;
+       const draft = run.execDraft ?? {
+         title: `${step.id} 无有效产出（观察）`,
+         content: `step ${step.id} 结束前没有 fgs_submit_fact；按契约 §5 落一条显式观察 Fact。`,
+@@ -1186,11 +1470,13 @@
+         title: draft.title,
+         content: draft.content,
+         producedBy: step.id,
++        findingType: draft.findingType ?? null,
+       });
+       try {
+         const next = run.controller.apply(op, graph);
+         run.controller.commit(next);
+         run.execDraft = null;
++        run.execDraftAt = null;
+         run.currentStepId = null;
+         if (limited) run.lastCommitRound = round;
+         syncProjectMeta(registryFor(exec?.agent, cfg, registries), run, next);
+@@ -1239,6 +1525,24 @@
+ 
+ function pickStep(run, graph, stepId) {
+   const open = openStepsOf(graph);
++  const cfg = run.cfg ?? DEFAULT_CONFIG;
++  const leaseMs = cfg.stepLeaseMs ?? 0;
++
++  /**
++   * 跨会话拒写（本次评估 D1 的根因）：
++   * 实测中 6/6 次 fact→step 绑定都是**跨会话**的，因为旧实现取「全局第一个 open step」。
++   * Cairn 的语义是 Dispatcher 派发、Agent 只跑自己的 intent，所以这里硬拒。
++   */
++  const ownershipError = (step) => {
++    const owner = stepOwnerOf(step);
++    if (!owner || owner === run.sid) return null;
++    if (!claimFresh(step, Date.now(), leaseMs)) return null; // 租约过期 ⇒ 可接手
++    return `step ${step.id} 已被另一个会话（${owner}）认领且租约未过期，本会话不得收束它。\n`
++      + '  （Cairn：Agent 不直接认领/写回别人的 Intent；只有 Dispatcher 派发的任务才归你。）\n'
++      + `  · 要接手：等租约过期（默认 ${Math.round(leaseMs / 60000)} 分钟）后会自动释放；\n`
++      + '  · 本会话现在该做的：用 fgs_open_step 开一个属于你自己的 step，或等待派发。';
++  };
++
+   // 本轮 step 一旦确定就不许换：显式 stepId 与当前 step 不一致 → 返回错误而不是静默替换
+   if (run.currentStepId) {
+     const current = open.find((s) => s.id === run.currentStepId);
+@@ -1249,16 +1553,28 @@
+             + ' 一轮只吃一个 open step（CONTRACT §5）；要换 step 请结束本回合。',
+         };
+       }
+-      return { step: current };
++      const denied = ownershipError(current);
++      return denied ? { error: denied } : { step: current };
+     }
+   }
+   if (stepId) {
+     const found = open.find((s) => s.id === stepId);
+     if (!found) return { error: `step ${stepId} 不是 open step，无法收束。` };
+-    return { step: found };
++    const denied = ownershipError(found);
++    return denied ? { error: denied } : { step: found };
+   }
+-  const first = open[0] ?? null;
+-  return first ? { step: first } : { error: '没有可收束的 open step。' };
++  // 缺省只取「本会话持有的 open step」——绝不取全局第一个，也不隐式认领。
++  const mine = open.filter((s) => stepOwnerOf(s) === run.sid);
++  if (mine.length > 0) return { step: mine[0] };
++  const free = open.filter((s) => !claimFresh(s, Date.now(), leaseMs));
++  return {
++    error: open.length === 0
++      ? '没有可收束的 open step。'
++      : (free.length > 0
++        ? `本会话没有持有的 open step；图上有 ${free.length} 个未认领/租约过期的 step`
++          + `（${free.map((s) => s.id).join(', ')}）。要接手请先 fgs_claim_step。`
++        : '没有可收束的 open step：图上的 open step 都被其他会话在租约内持有，且本会话没有自己的 step。'),
++  };
+ }
+ 
+ function resolveRoundStep(run, graph, stepId) {
+@@ -1298,6 +1614,7 @@
+   );
+   run.controller.commit(next);
+   run.execDraft = null;
++  run.execDraftAt = null;
+   run.currentStepId = null;
+   if (limited) run.lastCommitRound = round;
+   syncProjectMeta(registry, run, next);
+@@ -1318,6 +1635,17 @@
+       });
+     case 'drop_step':
+       return dropStepOp({ stepId: item.stepId, reason: item.reason });
++    case 'add_subgoal':
++      return addSubGoalOp({
++        criterion: item.criterion,
++        parentId: item.parentId || 'goal_final',
++        goalId: item.goalId || null,
++        reason: item.reason || null,
++      });
++    case 'drop_subgoal':
++      return dropSubGoalOp({ goalId: item.goalId, reason: item.reason });
++    case 'claim_step':
++      return claimStepOp({ stepId: item.stepId, owner: item.owner });
+     case 'change_step_priority':
+       return changePriorityOp({ stepId: item.stepId, priority: item.priority, reason: item.reason || null });
+     case 'satisfy_goal':
+@@ -1361,6 +1689,15 @@
+     // 控制面：建题 / 换题 / 列题。没有活动 Project 时正是要用它，所以任何状态都放行。
+     if (PROJECT_TOOLS.includes(tool)) return undefined;
+     const { problemId, run, reason } = activeRun(exec?.agent);
++    // 角色必须**每次都由 (图, 本会话) 现算**——缓存过的 run.role 会与图脱节，
++    // 导致会话卡死、且 §4 的 Decide 环境工具禁令静默失效（详见 refreshRole 注释）。
++    if (run) {
++      try {
++        refreshRole(run);
++      } catch {
++        /* 图不可读时退回缓存角色，让后续读取路径自己报错 */
++      }
++    }
+     if (GRAPH_TOOL_NAMES.includes(tool)) {
+       if (!problemId) {
+         return tool === 'fgs_status'
+@@ -1373,6 +1710,8 @@
+           ? 'FGS 已 /fgs off（本会话退出了 FGS）。重新进入用 fgs_project action=switch problemId=<id>。'
+           : 'FGS 未启动：先 fgs_seed（或 /fgs init <brief>）种题，再使用图工具。';
+       }
++      // v2：见 GRAPH_MUTATION_TOOLS 注释 —— 图操作工具两类活动都放行。
++      if (GRAPH_MUTATION_TOOLS.includes(tool)) return undefined;
+       if (!(ROLE_TOOLS[run.role] ?? []).includes(tool)) {
+         return run.role === 'execute'
+           ? `FGS 角色隔离：当前 Execute 轮不得调用 ${tool}（CONTRACT §5）。`
+@@ -1495,7 +1834,9 @@
+         const { run } = activeRun(scope);
+         if (!run || run.sid !== sid) return '';
+         try {
+-          const graph = run.store.load();
++          // 注入上下文同样必须现算角色：旧实现直接用缓存 run.role，
++          // 于是出现「面板说 decide、注入说 execute、图里 open=0」三面互相矛盾。
++          const graph = refreshRole(run);
+           const current = graph.steps.find((s) => s.id === run.currentStepId) ?? null;
+           return roleContextText({
+             role: run.role,
+--- a/controller/index.js
++++ b/controller/index.js
+@@ -35,6 +35,7 @@
+     if (f.content !== undefined && f.content !== null) d.content = f.content;
+     if (f.createdAt !== undefined) d.createdAt = f.createdAt;
+     if (f.producedBy !== undefined && f.producedBy !== null) d.producedBy = f.producedBy;
++    if (f.findingType !== undefined && f.findingType !== null) d.findingType = f.findingType;
+     return d;
+   });
+   const goals = graph.goals.map((g) => {
+@@ -42,6 +43,15 @@
+     if (g.satisfiedBy !== undefined && g.satisfiedBy !== null) d.satisfiedBy = g.satisfiedBy;
+     if (g.satisfiedReason !== undefined && g.satisfiedReason !== null) d.satisfiedReason = g.satisfiedReason;
+     if (g.satisfiedAt !== undefined && g.satisfiedAt !== null) d.satisfiedAt = g.satisfiedAt;
++    // v2：Sub Goal 是一等公民，且「可动态增删」——删=标记 dropped，不删历史。
++    // 只在 kind==='sub' 时落盘：既保持 goal_final 的 YAML 与旧版逐字节兼容
++    //（fixtures / replay 的 canonical diff 不受影响），也避免 `state:` 与 step 的
++    // state 在文本层面混淆（否则按 `state: "open"` 做文本断言会误命中 goal）。
++    if (g.kind === 'sub') {
++      if (g.parentId !== undefined && g.parentId !== null) d.parentId = g.parentId;
++      if (g.state !== undefined && g.state !== null) d.state = g.state;
++      if (g.droppedReason !== undefined && g.droppedReason !== null) d.droppedReason = g.droppedReason;
++    }
+     return d;
+   });
+   const steps = graph.steps.map((s) => {
+@@ -56,6 +66,9 @@
+     };
+     if (s.to !== undefined && s.to !== null) d.to = s.to;
+     if (s.reason !== undefined && s.reason !== null) d.reason = s.reason;
++    // Cairn「Intent 认领」：owner/claimedAt 是图的一部分（可随时停止/恢复、跨会话可见）。
++    if (s.owner !== undefined && s.owner !== null) d.owner = s.owner;
++    if (s.claimedAt !== undefined && s.claimedAt !== null) d.claimedAt = s.claimedAt;
+     return d;
+   });
+   return { facts, goals, steps };
+@@ -70,6 +83,7 @@
+       content: f.content ?? null,
+       createdAt: f.createdAt === undefined || f.createdAt === null ? null : String(f.createdAt),
+       producedBy: f.producedBy ?? null,
++      findingType: f.findingType ?? null,
+     })),
+     goals: (src.goals ?? []).map((g) => ({
+       id: g.id,
+@@ -79,6 +93,9 @@
+       satisfiedBy: g.satisfiedBy ?? null,
+       satisfiedReason: g.satisfiedReason ?? null,
+       satisfiedAt: g.satisfiedAt === undefined || g.satisfiedAt === null ? null : String(g.satisfiedAt),
++      parentId: g.parentId ?? null,
++      state: g.state ?? 'open',
++      droppedReason: g.droppedReason ?? null,
+     })),
+     steps: (src.steps ?? []).map((s) => ({
+       id: s.id,
+@@ -90,6 +107,8 @@
+       createdAt: s.createdAt === undefined || s.createdAt === null ? '' : String(s.createdAt),
+       to: s.to ?? null,
+       reason: s.reason ?? null,
++      owner: s.owner ?? null,
++      claimedAt: s.claimedAt === undefined || s.claimedAt === null ? null : String(s.claimedAt),
+     })),
+   };
+ }
+@@ -235,16 +254,29 @@
+         errs.push(`fact id 非法: ${f.id}`);
+       }
+     }
+-    // CONTRACT §1/§2：单 goal_final，不做 kind:sub SubGoal；id 只能是 goal_final
++    // v2（Cairn_Y）：「Goal 描述项目的完成条件，即搜索的终止条件。**也存在可以动态增删的
++    // Sub Goal**。」因此这里不再要求「只有一个 goal_final」：
++    //   · 必须恰有一个 kind==final 的 goal_final（终止条件必须有且只有一个根）；
++    //   · 其余 goal 必须是 kind==sub、id 形如 goal_xxx、且 parentId 指向已存在的 goal。
++    // 只追加语义：Sub Goal 的「删除」是 state='dropped'，不是从数组里移除。
+     const finals = graph.goals.filter((g) => g.id === 'goal_final');
+     if (finals.length !== 1 || finals[0].kind !== 'final') {
+       errs.push('goals 必须恰含一个 kind==final 的 goal_final');
+     }
++    const goalIds = new Set(graph.goals.map((g) => g.id));
+     for (const g of graph.goals) {
+-      if (g.id !== 'goal_final') {
+-        errs.push(`goal id 非法（CONTRACT §1 单 goal_final，不做 SubGoal）: ${g.id}`);
+-      } else if (g.kind !== 'final') {
+-        errs.push(`goal_final.kind 必须为 final: ${g.kind}`);
++      if (g.id === 'goal_final') {
++        if (g.kind !== 'final') errs.push(`goal_final.kind 必须为 final: ${g.kind}`);
++        continue;
++      }
++      if (g.kind !== 'sub') {
++        errs.push(`非 goal_final 的 goal 必须是 kind==sub: ${g.id} kind=${g.kind}`);
++      }
++      if (!(typeof g.id === 'string' && /^goal_[a-z0-9_]+$/.test(g.id))) {
++        errs.push(`Sub Goal id 非法（须 goal_xxx）: ${g.id}`);
++      }
++      if (g.parentId && !goalIds.has(g.parentId)) {
++        errs.push(`Sub Goal parentId 引用不存在 goal: ${g.id} -> ${g.parentId}`);
+       }
+     }
+     for (const s of graph.steps) {
+@@ -302,6 +334,8 @@
+   constructor(store, options = {}) {
+     this.store = store;
+     this.verifyHook = options.verifyHook ?? null;
++    this.claimOptions = options.claimOptions ?? {};
++    this.findingTypes = options.findingTypes ?? [];
+     this.applied = [];
+     this.rejected = [];
+   }
+@@ -349,6 +383,12 @@
+     switch (op?.type) {
+       case OP.OPEN_STEP:
+         return this.openStep(graph, op);
++      case OP.CLAIM_STEP:
++        return this.claimStep(graph, op, this.claimOptions);
++      case OP.ADD_SUBGOAL:
++        return this.addSubGoal(graph, op);
++      case OP.DROP_SUBGOAL:
++        return this.dropSubGoal(graph, op);
+       case OP.DROP_STEP:
+         return this.dropStep(graph, op);
+       case OP.CHANGE_PRIORITY:
+@@ -390,10 +430,42 @@
+       createdAt: nowIsoZ(),
+       to: null,
+       reason: null,
++      owner: op.owner ?? null,
++      claimedAt: op.claimedAt ?? (op.owner ? nowIsoZ() : null),
+     });
+     return `open_step ${sid}`;
+   }
+ 
++  /**
++   * claim_step：认领/续租一个 open step（Cairn：Intent 认领有心跳超时与自动释放）。
++   *
++   * 只允许认领「未认领」或「租约已过期」的 step；被其他会话在租约内持有时拒写。
++   * `leaseMs <= 0` 视为不检查租约（用于显式夺取/测试）。
++   */
++  claimStep(graph, op, { leaseMs = 0 } = {}) {
++    const step = graph.steps.find((s) => s.id === op.stepId);
++    if (!step) throw new WriteRejected(`claim_step 目标不存在: ${op.stepId}`);
++    if (step.state !== 'open') {
++      throw new WriteRejected(`claim_step 目标不是 open step: ${op.stepId}（state=${step.state}）`);
++    }
++    if (!op.owner) throw new WriteRejected('claim_step 缺 owner');
++    const now = Date.now();
++    const held = step.owner
++      && step.owner !== op.owner
++      && leaseMs > 0
++      && Number.isFinite(Date.parse(step.claimedAt ?? ''))
++      && now - Date.parse(step.claimedAt) < leaseMs;
++    if (held) {
++      throw new WriteRejected(
++        `step ${op.stepId} 已被会话 ${step.owner} 认领且租约未过期；`
++        + '不能跨会话收束（Cairn：Dispatcher 才是协议的唯一写入者，Agent 不得抢写别人的 Intent）。',
++      );
++    }
++    step.owner = op.owner;
++    step.claimedAt = op.claimedAt ?? nowIsoZ();
++    return `claim_step ${op.stepId} -> ${op.owner}`;
++  }
++
+   dropStep(graph, op) {
+     if (!hasText(op.reason)) throw new WriteRejected('drop_step 缺 reason（拒收，CONTRACT §4）');
+     const step = findStep(graph, op.stepId);
+@@ -405,6 +477,54 @@
+     return `drop_step ${op.stepId}`;
+   }
+ 
++  /** v2：Sub Goal —— Goal 是「搜索的终止条件」，可动态增删。只追加，不修改既有 goal。 */
++  addSubGoal(graph, op) {
++    if (!hasText(op.criterion)) {
++      throw new WriteRejected('add_subgoal 缺 criterion（Sub Goal 必须写清达成标准）');
++    }
++    const parentId = op.parentId || 'goal_final';
++    if (!graph.goals.some((g) => g.id === parentId)) {
++      throw new WriteRejected(`add_subgoal.parentId 引用不存在 goal: ${parentId}`);
++    }
++    const used = new Set(graph.goals.map((g) => g.id));
++    let gid = op.goalId || null;
++    if (gid) {
++      if (used.has(gid)) throw new WriteRejected(`goal id 已存在: ${gid}`);
++      if (!/^goal_[a-z0-9_]+$/.test(gid)) throw new WriteRejected(`goal id 非法（须 goal_xxx）: ${gid}`);
++    } else {
++      let n = 1;
++      while (used.has(`goal_sub_${String(n).padStart(3, '0')}`)) n += 1;
++      gid = `goal_sub_${String(n).padStart(3, '0')}`;
++    }
++    graph.goals.push({
++      id: gid,
++      kind: 'sub',
++      criterion: op.criterion,
++      createdAt: nowIsoZ(),
++      parentId,
++      state: 'open',
++      satisfiedBy: null,
++      satisfiedReason: null,
++      satisfiedAt: null,
++      droppedReason: null,
++    });
++    return `add_subgoal ${gid}`;
++  }
++
++  /** v2：Sub Goal 可动态删除 —— 但图是「只追加」的，所以是**标记 dropped**，历史仍在。 */
++  dropSubGoal(graph, op) {
++    if (!hasText(op.reason)) throw new WriteRejected('drop_subgoal 缺 reason（拒收）');
++    const goal = graph.goals.find((g) => g.id === op.goalId);
++    if (!goal) throw new WriteRejected(`drop_subgoal 目标不存在: ${op.goalId}`);
++    if (goal.kind !== 'sub') {
++      throw new WriteRejected(`drop_subgoal 只能删 Sub Goal，不能删 ${op.goalId}（kind=${goal.kind}）`);
++    }
++    if (goal.state === 'dropped') throw new WriteRejected(`drop_subgoal 目标已 dropped: ${op.goalId}`);
++    goal.state = 'dropped';
++    goal.droppedReason = op.reason;
++    return `drop_subgoal ${op.goalId}`;
++  }
++
+   changePriority(graph, op) {
+     if (!isValidPriority(op.priority)) throw new WriteRejected(`priority 非法: ${op.priority}`);
+     const step = findStep(graph, op.stepId);
+@@ -427,6 +547,20 @@
+         `submit_fact.producedBy 指向非 open step: ${op.producedBy} state=${step.state}`,
+       );
+     }
++    const findingType = op.findingType ?? null;
++    if (findingType !== null && !hasText(findingType)) {
++      throw new WriteRejected('submit_fact.findingType 不得为空白（要么不写，要么写类型）');
++    }
++    if (findingType !== null && Array.isArray(this.findingTypes) && this.findingTypes.length > 0
++      && !this.findingTypes.includes(findingType)) {
++      throw new WriteRejected(
++        `findingType 非法: ${findingType}（当前允许: ${this.findingTypes.join(', ')}）——`
++        + 'Finding 的类型可动态定义，改 config.findingTypes 即可扩展',
++      );
++    }
++    if (findingType !== null && findingType.length > 64) {
++      throw new WriteRejected('submit_fact.findingType 过长（>64）');
++    }
+     const fid = this.store.nextFactId(graph);
+     if (graph.facts.some((f) => f.id === fid)) throw new WriteRejected(`fact id 已存在: ${fid}`);
+     graph.facts.push({
+@@ -435,6 +569,7 @@
+       content: op.content,
+       createdAt: nowIsoZ(),
+       producedBy: op.producedBy,
++      findingType,
+     });
+     step.state = 'done';
+     step.to = fid;
+--- a/controller/ops.js
++++ b/controller/ops.js
+@@ -6,6 +6,9 @@
+ 
+ export const OP = Object.freeze({
+   OPEN_STEP: 'open_step',
++  CLAIM_STEP: 'claim_step',
++  ADD_SUBGOAL: 'add_subgoal',
++  DROP_SUBGOAL: 'drop_subgoal',
+   DROP_STEP: 'drop_step',
+   CHANGE_PRIORITY: 'change_step_priority',
+   SUBMIT_FACT: 'submit_fact',
+@@ -23,9 +26,26 @@
+   }
+ }
+ 
+-/** open_step：`from` 非空；可预分配 stepId（batch commit）。 */
+-export function openStepOp({ action, from, actor = 'agent', priority = 'normal', stepId = null }) {
+-  return { type: OP.OPEN_STEP, action, from, actor, priority, stepId };
++/**
++ * open_step：`from` 非空；可预分配 stepId（batch commit）。
++ *
++ * `owner` / `claimedAt`：Cairn 的「Intent 认领」语义（《无径之径》§系统架构：
++ * 「Intent 认领有心跳超时与自动释放」）。开 step 的会话即认领者；缺省 null
++ * 表示未认领，任何会话可认领后执行。
++ */
++export function openStepOp({
++  action, from, actor = 'agent', priority = 'normal', stepId = null,
++  owner = null, claimedAt = null,
++}) {
++  return { type: OP.OPEN_STEP, action, from, actor, priority, stepId, owner, claimedAt };
++}
++
++/**
++ * claim_step：把一个 open step 认领给某会话（写 owner + claimedAt）。
++ * 只有 Controller 改图；认领同样是一次受校验的写图操作。
++ */
++export function claimStepOp({ stepId, owner, claimedAt = null }) {
++  return { type: OP.CLAIM_STEP, stepId, owner, claimedAt };
+ }
+ 
+ /** drop_step：必须 reason。 */
+@@ -38,9 +58,29 @@
+   return { type: OP.CHANGE_PRIORITY, stepId, priority, reason };
+ }
+ 
+-/** submit_fact：producedBy 必填（origin 种子除外）。 */
+-export function submitFactOp({ title, content, producedBy }) {
+-  return { type: OP.SUBMIT_FACT, title, content, producedBy };
++/**
++ * submit_fact：producedBy 必填（origin 种子除外）。
++ *
++ * `findingType`（v2 Cairn_Y）：Finding = **搜索过程的结构化产物**（漏洞挖掘类任务里就是安全漏洞）。
++ * Cairn_Y 的图叫 **Fact-Goal-Step Graph**，顶层只有三种节点，所以 Finding **不是第四种节点**，
++ * 而是**带类型标记的 Fact**（graph.yaml 顶层禁止 findings 键，CONTRACT §2 / GraphStore 双重校验）。
++ * 类型可动态定义（由 config.findingTypes 约束，留空即自由定义）。
++ */
++export function submitFactOp({ title, content, producedBy, findingType = null }) {
++  return { type: OP.SUBMIT_FACT, title, content, producedBy, findingType };
++}
++
++/**
++ * add_subgoal：v2 明确「也存在可以动态增删的 Sub Goal」，Goal 是**搜索的终止条件**。
++ * 只追加：新增一个 kind='sub' 的 goal；不得修改既有 goal。
++ */
++export function addSubGoalOp({ criterion, parentId = 'goal_final', goalId = null, reason = null }) {
++  return { type: OP.ADD_SUBGOAL, criterion, parentId, goalId, reason };
++}
++
++/** drop_subgoal：v2「可动态增删」；**只标记不删除**（图只追加），必须给 reason。 */
++export function dropSubGoalOp({ goalId, reason }) {
++  return { type: OP.DROP_SUBGOAL, goalId, reason };
+ }
+ 
+ /** origin 种题种子：唯一免 producedBy 的 fact 写入，同时种 goal_final。 */
+--- a/hooks/validate_write.js
++++ b/hooks/validate_write.js
+@@ -44,6 +44,27 @@
+     case OP.CHANGE_PRIORITY:
+     case OP.SEED_ORIGIN:
+       return;
++    case OP.ADD_SUBGOAL:
++      // v2：Sub Goal 是「搜索的终止条件」，必须写清达成标准。
++      if (!hasText(op.criterion)) {
++        throw new WriteRejected('add_subgoal 缺 criterion（拒收）');
++      }
++      return;
++    case OP.DROP_SUBGOAL:
++      // v2：可动态删除，但图只追加 ⇒ 标记 dropped，且必须给 reason。
++      if (!hasText(op.goalId) || !hasText(op.reason)) {
++        throw new WriteRejected('drop_subgoal 缺 goalId/reason（拒收）');
++      }
++      return;
++    case OP.CLAIM_STEP:
++      // Cairn：Intent 认领（含租约）。缺 owner 等于没人认领，缺 stepId 无从认领，均拒写。
++      if (!hasText(op.owner)) {
++        throw new WriteRejected('claim_step 缺 owner（认领必须指名会话，拒写）');
++      }
++      if (!hasText(op.stepId)) {
++        throw new WriteRejected('claim_step 缺 stepId（拒写）');
++      }
++      return;
+     default:
+       throw new WriteRejected(`未知操作类型: ${op?.type}`);
+   }
+--- a/CONTRACT.md
++++ b/CONTRACT.md
+@@ -9,18 +9,30 @@
+ 
+ ## 1. MVP 范围（冻结）
+ 
+-**做**：单 `goal_final` + FGS 图（`facts` / `goals` / `steps`）+ Decide/Execute 双 toolset + `satisfy_goal` 硬门 + `reopen` + Fact 蒸馏拒写。
++> **2026-10-13 v2 修订**：本节与 §2/§5 已按 **Cairn_Y（最新版）** 的核心思想修订。
++> 依据：《AI 自动化渗透架构 Cairn 满分登顶 TsecBench Cybench》（提炼见 `CORE_IDEAS_v2.md`）。
++> 原文：「Goal 描述项目的完成条件，即搜索的终止条件。**也存在可以动态增删的 Sub Goal**。」
++> 「Finding 是 Cairn_Y 引入的一个很重要的概念……**Finding 也是可以动态定义的**。」
++> 变更明细与理由见文末 **§12**。
++
++**做**：单 `goal_final` + **可动态增删的 Sub Goal（`kind: sub`）** + FGS 图（`facts` / `goals` / `steps`）
+++ **Finding（= 带 `findingType` 的 Fact，类型可动态定义）** + Decide/Execute 双 toolset（**按 v2 语义重划，见 §5**）
+++ `satisfy_goal` 硬门 + `reopen` + Fact 蒸馏拒写 + **Step 派发绑定（`owner`/`claimedAt`）与显式 `claim_step`**。
+ 
+-**不做**：独立 `findings[]` / `submit_finding`；`kind: sub` SubGoal；Fact–Intent 旧命名；Hint 一等公民；多 worker 租约（claim/heartbeat）；文章 Finding→SubGoal 中间态兼容。
++**不做**：独立 `findings[]` 顶层节点（图的名字就是 Fact-Goal-Step Graph，Finding 用 Fact 的 `findingType` 表达）；
++Fact–Intent 旧命名；Hint 一等公民；**以具体任务角色为主的多 Agent / 多类专业 Subagent**（v2 明确反对）。
+ 
+ ---
+ 
+ ## 2. 图序列化（唯一真源）
+ 
+ - 磁盘主真相：YAML，顶层键**仅** `facts` → `goals` → `steps`。
+-- ID 规则：`fact_origin` | `fact_NNN`；`goal_final`；`step_NNN`。
++- ID 规则：`fact_origin` | `fact_NNN`；`goal_final` | **`goal_sub_NNN`**；`step_NNN`。
+ - **禁止**键：`Intent` / `Hint` / `findings`（及同义一等公民节点）。
++  → **Finding 不是第四种节点**，而是 Fact 上的可选 `findingType` 标签（v2 §12）。
+ - 因果：`Fact(s) --from--> Step --to/producedBy--> 新 Fact`；Goal 不连边，靠 `satisfy_goal` 引用 fact id。
++- **只追加（v2）**：任何「删除」都是**标记**（`step.state='dropped'` / `goal.state='dropped'` + reason），
++  节点永不从数组里移除；`Fact` 一旦写入即不可变。
+ 
+ ---
+ 
+@@ -124,3 +136,32 @@
+ ```
+ 
+ 实现细节见 `DeepSeek_FGS_harness_plugin_design.md`；本契约只冻结「必须如此」。
++
++---
++
++## 12. v2（Cairn_Y）修订记录
++
++> 触发：用户提供 Cairn 最新版文章并要求**以最新版思想为核心**后续工作。
++> 来源：《AI 自动化渗透架构 Cairn 满分登顶 TsecBench Cybench —— 众人向左，我偏向右》
++> https://mp.weixin.qq.com/s/ZzKF_0MOb0cak9izhHqCUQ ｜ 提炼：`CORE_IDEAS_v2.md`
++
++### 12.1 修订条目
++
++| # | 原冻结条款 | v2 修订 | 理由（原文依据） |
++|---|---|---|---|
++| 1 | 不做 `kind: sub` SubGoal | **做**：Sub Goal 一等公民，可动态增删 | 「Goal 描述项目的完成条件，即搜索的终止条件。**也存在可以动态增删的 Sub Goal**。」 |
++| 2 | 不做 Finding | **做**：`Finding = 带 findingType 的 Fact`，类型可动态定义（`config.findingTypes`，留空即自由定义） | 「Finding 是 Cairn_Y 引入的一个很重要的概念……**Finding 也是可以动态定义的**。」 |
++| 3 | 未明确 | **图只追加**：删除一律是标记（`state='dropped'` + reason），节点永不移除 | 「把搜索过程的全部状态外化成一张**只追加**的图。」 |
++| 4 | 「有 open step → Execute，否则 Decide」 | **role = 本会话是否被派发（持有）一个 open Step**；没有 → Decide | v2：Decide/Execute 是「**独立的运行过程**，而非固定角色的 SubAgent」，且「**没有独立的跨会话记忆机制**」——所以不能把角色缓存成会话状态 |
++| 5 | 未明确 | **Decide 必须能在有 open step 时工作**：`open_step`/`drop_step`/`change_step_priority`/`add_subgoal`/`drop_subgoal`/`commit`/`preview`/`claim_step` 在两类活动都放行 | v2：Decide 在「**图上信息有增加或者变化时**被触发」，职责是「对 Step 进行评估，进行 Step 的添加、废弃或者优先级调整」——这必然发生在有 open step 时；否则图会僵死 |
++| 6 | 多 worker 租约**不做** | **做**：`claim_step` + `owner`/`claimedAt`（`stepLeaseMs` 默认 30min 超时后可被接手） | v1《无径之径》：「**Intent 认领有心跳超时与自动释放**」「Dispatcher 是协议的唯一写入者」；而实测证明「谁先看到谁执行」会造成 **6/6 跨会话因果链错位** |
++| 7 | 未明确 | **§4 收窄为真正重要的那条**：没有 Step 的会话不得使用环境执行工具；goal 级判断（`satisfy_goal`/`reopen`）仍由 Decide 独占 | v2 只规定 Decide「只拥有查看和操作 FGS 图的 Tool」、Execute 拥有改世界状态的 Tool；互相禁止图操作并非 v2 要求，且会造成僵死 |
++
++### 12.2 保留不变的
++
++- 图是**唯一外化记忆**；顶层键只有 `facts` / `goals` / `steps`。
++- 单写者 Controller + 写图前 preflight；校验失败拒写、不落盘。
++- Fact 蒸馏（title ≤120 字 / content >8KiB 必须是产物文件路径）；因果铁律（`from` 非空且存在）。
++- `satisfy_goal` 外部校验硬门；`reopen` 只清 `satisfied*` 并追加 feedback，永不删除历史。
++- 「没在时限内到达 Goal 也要写下结论 Fact」（`forceCloseStep` 兜底）。
++- Decide/Execute 都从**干净上下文**起，无跨会话记忆。
+--- /dev/null	2026-10-13 09:16:23.780773900 +0800
++++ b/tests/cairn_fixes.test.mjs
+@@ -0,0 +1,332 @@
++/**
++ * Cairn 核心思想驱动的回归测试（对应真实跑分中实测到的缺陷）。
++ *
++ * 依据：
++ *  - v1《无径之径》 : 黑板是唯一外化记忆；Dispatcher 是协议唯一写入者；Intent 认领有超时释放
++ *  - v2《Cairn_Y》  : FGS 图只追加；Decide/Execute 是**独立运行过程**、不是固定角色；
++ *                     两者都是注入不同 Tool/Prompt 的 Agent Loop，无跨会话记忆
++ *
++ * 每条用例都对应一个"审计用哪招打进来，就用哪招锁回去"。
++ */
++import test from 'node:test';
++import assert from 'node:assert/strict';
++import fs from 'node:fs';
++import path from 'node:path';
++
++import { apply as applyPlugin } from '../index.js';
++import { GraphStore } from '../controller/index.js';
++import {
++  ensureActiveProject,
++  makeFakeAgent,
++  makeFakeHost,
++  projectGraphPath,
++  tmpDir,
++  wireServices,
++} from './helpers.mjs';
++
++/** 直接读图（用于 append-only 计数断言）。 */
++function storeOf(cwd) {
++  return new GraphStore(path.dirname(projectGraphPath(cwd)), {});
++}
++
++function boot(overrides = {}) {
++  const host = makeFakeHost();
++  const services = wireServices(host);
++  for (const name of ['bash', 'read', 'web_fetch', 'web_search', 'subagent', 'workflow', 'todo_write', 'skill']) {
++    host.ctx.tools.register({
++      name,
++      description: `fake ${name}`,
++      parameters: { type: 'object', properties: {}, additionalProperties: false },
++      output: { schema: { type: 'object' }, render: () => [] },
++      async execute() {
++        return { ok: true, text: `${name} RAN` };
++      },
++    });
++  }
++  host.ctx.services = { ...host.ctx.services, ...services };
++  applyPlugin(host.ctx, { stateDir: '.fgs', ...overrides });
++  const cwd = tmpDir();
++  const agent = makeFakeAgent('sess-a', cwd);
++  host.emit('agent/created', { agent });
++  return { host, agent, cwd };
++}
++
++async function seed(host, agent) {
++  const created = ensureActiveProject(host, agent);
++  assert.equal(created.kind, 'success', JSON.stringify(created));
++  const result = await host.callTool('fgs_seed', { brief: '{"target":"http://x"}' }, agent);
++  assert.equal(result.ok, true, result.text);
++}
++
++/** 同 workspace、不同会话（模拟 DSH 的 subagent / 另一个 worker）。 */
++function secondAgent(host, cwd, id = 'sess-b') {
++  const b = makeFakeAgent(id, cwd);
++  host.emit('agent/created', { agent: b });
++  return b;
++}
++
++/* ------------------------------------------------------------------ D1 */
++
++test('D1：一个会话不得收束另一个会话持有的 open step（不写回别人的 Step）', async () => {
++  const { host, agent, cwd } = boot();
++  await seed(host, agent);
++  await host.callTool('fgs_commit', {
++    operations: [{ op: 'open_step', action: 'A 的探路', from: ['fact_origin'] }],
++  }, agent);
++  host.ctx.setTurn(2);
++  // A 第一次调用即由图派发并认领该 step（owner = sess-a）
++  assert.equal((await host.callTool('fgs_submit_fact', { title: 'A 的发现', content: 'x' }, agent)).ok, true);
++
++  const graphText = fs.readFileSync(projectGraphPath(cwd), 'utf8');
++  assert.match(graphText, /owner:\s*"?sess-a"?/, '认领必须落到图上（图是唯一外化记忆）');
++
++  // B：同 workspace 的另一个会话，不得抢写 A 的 step
++  const b = secondAgent(host, cwd);
++  host.ctx.setTurn(3);
++  const denied = await host.callTool('fgs_submit_fact', { title: 'B 抢写', content: 'y' }, b);
++  assert.equal(denied.ok, false, 'B 不得收束 A 的 step');
++  assert.match(denied.text, /角色隔离|已被另一个会话/);
++
++  // 图上不能出现 B 的 fact（否则就是 6/6 跨会话错位绑定的复现）
++  assert.doesNotMatch(fs.readFileSync(projectGraphPath(cwd), 'utf8'), /B 抢写/);
++});
++
++/* ------------------------------------------------------------------ D2 */
++
++test('D2：别的会话把本会话的 step 收束后，本会话必须立即回到 Decide（角色不得缓存）', async () => {
++  const { host, agent, cwd } = boot();
++  await seed(host, agent);
++  await host.callTool('fgs_commit', {
++    operations: [{ op: 'open_step', action: '探路', from: ['fact_origin'] }],
++  }, agent);
++  host.ctx.setTurn(2);
++  // 此时本会话是 Execute：环境工具放行
++  assert.equal((await host.callTool('bash', {}, agent)).ok, true, 'Execute 轮应放行环境工具');
++
++  // 模拟「另一个会话/进程把该 step 收束掉」——直接改图，等同别的 writer 落盘。
++  // 这正是真实跑分里发生的事：step 归因于本会话开的，却被别的会话 commit_step 收掉。
++  const p = projectGraphPath(cwd);
++  fs.writeFileSync(p, fs.readFileSync(p, 'utf8').replace('state: "open"', 'state: "done"'));
++
++  // 旧实现：run.role 仍是缓存的 execute ⇒ bash 放行、fgs_open_step 被拒 = 死锁
++  //         且 §4「Decide 禁止环境工具」静默失效
++  // 新实现：每次由 (图, 本会话) 现算 ⇒ 回 Decide，环境工具必须被拒
++  const denied = await host.callTool('bash', {}, agent);
++  assert.equal(denied.ok, false, 'step 已关闭 ⇒ 必须回 Decide；环境工具应被拒');
++  assert.match(denied.text, /Decide|禁止/);
++
++  // 而且不得卡死：回到 Decide 后可以规划新 step（旧实现这里会被角色门拒掉）
++  const reopened = await host.callTool('fgs_open_step', { action: '新方向', from: ['fact_origin'] }, agent);
++  assert.equal(reopened.ok, true, `回到 Decide 必须能继续规划: ${reopened.text}`);
++});
++
++/* ------------------------------------------------------------------ D3 */
++
++test('D3：同回合「先收束、再开新 step、并立刻收束」不得留下孤儿 step 与僵尸草稿', async () => {
++  const { host, agent, cwd } = boot();
++  await seed(host, agent);
++  host.ctx.setTurn(5);
++
++  // 第一步：开 + 收束（消耗本回合的第一次收束）
++  await host.callTool('fgs_commit', {
++    operations: [{ op: 'open_step', action: '第一步', from: ['fact_origin'] }],
++  }, agent);
++  assert.equal((await host.callTool('fgs_submit_fact', { title: 'a', content: 'c' }, agent)).ok, true);
++  assert.equal((await host.callTool('fgs_commit_step', {}, agent)).ok, true);
++
++  // 同一回合内再开一个 step 并立刻收束（旧实现：第二次 commit_step 一律被拒 ⇒
++  // step_002 变孤儿 + 草稿永久滞留，实测在 /fgs/state 里挂了 1.5 小时）
++  assert.equal((await host.callTool('fgs_open_step', { action: '第二步', from: ['fact_origin'] }, agent)).ok, true);
++  assert.equal((await host.callTool('fgs_commit', {}, agent)).ok, true);
++  assert.equal((await host.callTool('fgs_submit_fact', { title: 'b', content: 'c' }, agent)).ok, true);
++  const second = await host.callTool('fgs_commit_step', {}, agent);
++  assert.equal(second.ok, true, `本回合刚开的 step 应可在本回合收束: ${second.text}`);
++
++  const graphText = fs.readFileSync(projectGraphPath(cwd), 'utf8');
++  assert.doesNotMatch(graphText, /state: "open"/, '不得留下孤儿 open step');
++  assert.match(graphText, /"b"/, '第二段发现必须真的落盘，而不是丢在草稿里');
++  // 草稿必须被清空（无僵尸草稿）
++  assert.ok(!(await host.callTool('fgs_status', {}, agent)).text.includes('草稿:'), '不应残留草稿');
++});
++
++/* ------------------------------------------------------------------ D5 */
++
++test('D5：fgs_status 显式拒绝未知参数（不得静默吞掉垃圾入参后返回摘要）', async () => {
++  const { host, agent } = boot();
++  await seed(host, agent);
++  const bad = await host.callTool('fgs_status', { action: 'bad ref probe', from: ['fact_999'] }, agent);
++  assert.equal(bad.ok, false, '垃圾入参必须被显式拒绝');
++  assert.match(bad.text, /不接受任何参数/);
++  // 无参仍正常
++  assert.equal((await host.callTool('fgs_status', {}, agent)).ok, true);
++});
++
++/* ------------------------------------------------------------------ v2 */
++
++test('v2：open step 必须显示认领状态（谁在推进 / 是否可接手）', async () => {
++  const { host, agent } = boot();
++  await seed(host, agent);
++  await host.callTool('fgs_commit', {
++    operations: [{ op: 'open_step', action: '探路', from: ['fact_origin'] }],
++  }, agent);
++  const text = (await host.callTool('fgs_status', {}, agent)).text;
++  assert.match(text, /\(mine\)/, '本会话持有的 step 应标注 mine');
++  assert.match(text, /goals=/, '应同时报 goals 计数（Sub Goal 是一等公民）');
++});
++
++/* ------------------------------------------------- Sub Goal（v2 一等公民）*/
++
++test('v2：Sub Goal 可动态增删，且「图只追加」——删除即标记 dropped，不删历史', async () => {
++  const { host, agent, cwd } = boot();
++  await seed(host, agent);
++
++  assert.equal((await host.callTool('fgs_add_subgoal', { criterion: '拿到入口权限' }, agent)).ok, true);
++  assert.equal((await host.callTool('fgs_commit', {}, agent)).ok, true);
++  let g = fs.readFileSync(projectGraphPath(cwd), 'utf8');
++  assert.match(g, /goal_sub_001/);
++  assert.match(g, /kind: "sub"/);
++  assert.match(g, /parentId: "goal_final"/);
++  assert.match(g, /拿到入口权限/);
++
++  assert.equal((await host.callTool('fgs_drop_subgoal', {
++    goalId: 'goal_sub_001', reason: '已被最终目标覆盖',
++  }, agent)).ok, true);
++  assert.equal((await host.callTool('fgs_commit', {}, agent)).ok, true);
++  g = fs.readFileSync(projectGraphPath(cwd), 'utf8');
++  assert.match(g, /goal_sub_001/, 'Sub Goal 节点不得被删除（图只追加）');
++  assert.match(g, /state: "dropped"/);
++  assert.match(g, /已被最终目标覆盖/);
++  // 父 goal 不能被 Sub Goal 的增删改动
++  assert.match(g, /kind: "final"/);
++});
++
++test('v2：drop_subgoal 必须给 reason；不能删 goal_final', async () => {
++  const { host, agent } = boot();
++  await seed(host, agent);
++  await host.callTool('fgs_add_subgoal', { criterion: 'x' }, agent);
++  await host.callTool('fgs_commit', {}, agent);
++  const noReason = await host.callTool('fgs_drop_subgoal', { goalId: 'goal_sub_001' }, agent);
++  assert.equal(noReason.ok, false, '缺 reason 应在入草稿时就被拒（fail fast）');
++  // 删 goal_final：preflight 阶段拿不到图、判不了 kind，所以能进草稿；
++  // 但**落盘时**必须被 Controller 拒 —— 这才是有意义的硬约束。
++  const wrongTarget = await host.callTool('fgs_drop_subgoal', { goalId: 'goal_final', reason: 'r' }, agent);
++  assert.equal(wrongTarget.ok, true, 'preflight 阶段无法判断目标 kind，允许进草稿');
++  const wrongCommit = await host.callTool('fgs_commit', {}, agent);
++  assert.equal(wrongCommit.ok, false, '落盘时必须拒绝删 goal_final');
++  assert.match(wrongCommit.text, /只能删 Sub Goal/);
++});
++
++/* ------------------------------------------------------- Finding（v2 新增）*/
++
++test('v2：Finding = 搜索过程的结构化产物（带类型的 Fact），且类型可动态定义', async () => {
++  const { host, agent, cwd } = boot();
++  await seed(host, agent);
++  await host.callTool('fgs_commit', {
++    operations: [{ op: 'open_step', action: '找漏洞', from: ['fact_origin'] }],
++  }, agent);
++  host.ctx.setTurn(2);
++  assert.equal((await host.callTool('fgs_submit_fact', {
++    title: '发现 SQLi', content: '注入点 /login 的 username', findingType: 'vuln',
++  }, agent)).ok, true);
++  assert.equal((await host.callTool('fgs_commit_step', {}, agent)).ok, true);
++
++  const g = fs.readFileSync(projectGraphPath(cwd), 'utf8');
++  assert.match(g, /findingType: "vuln"/, 'Finding 必须落到图上');
++  const st = (await host.callTool('fgs_status', {}, agent)).text;
++  assert.match(st, /findings=1/);
++  assert.match(st, /finding fact_001 \[vuln\]/);
++});
++
++test('v2：findingTypes 白名单可动态定义；不在白名单内的类型被拒', async () => {
++  const { host, agent } = boot({ findingTypes: ['vuln', 'misconfig'] });
++  await seed(host, agent);
++  await host.callTool('fgs_commit', {
++    operations: [{ op: 'open_step', action: '找漏洞', from: ['fact_origin'] }],
++  }, agent);
++  host.ctx.setTurn(2);
++  const bad = await host.callTool('fgs_submit_fact', {
++    title: 'h', content: 'c', findingType: 'not-in-whitelist',
++  }, agent);
++  assert.equal(bad.ok, false, '白名单外的 findingType 必须拒写');
++  assert.match(bad.text, /findingType 非法/);
++  assert.equal((await host.callTool('fgs_submit_fact', {
++    title: 'ok', content: 'c', findingType: 'vuln',
++  }, agent)).ok, true);
++});
++
++/* ------------------------------------------------ append-only 不变量 */
++
++test('v2：图只追加——drop_step / drop_subgoal 都不减少节点数', async () => {
++  const { host, agent, cwd } = boot();
++  await seed(host, agent);
++  const store = storeOf(cwd);
++  const count = () => {
++    const g = store.load();
++    return { f: g.facts.length, go: g.goals.length, st: g.steps.length };
++  };
++  const c0 = count();
++
++  await host.callTool('fgs_commit', {
++    operations: [
++      { op: 'open_step', action: 'A', from: ['fact_origin'] },
++      { op: 'open_step', action: 'B', from: ['fact_origin'] },
++    ],
++  }, agent);
++  const c1 = count();
++  assert.equal(c1.st, c0.st + 2);
++
++  // 本会话已认领 A；显式 drop 掉 B（B 仍是 open）
++  assert.equal((await host.callTool('fgs_drop_step', {
++    stepId: 'step_002', reason: '死胡同',
++  }, agent)).ok, true);
++  assert.equal((await host.callTool('fgs_commit', {}, agent)).ok, true);
++  const c2 = count();
++  assert.equal(c2.st, c1.st, 'drop_step 不得删除节点');
++
++  await host.callTool('fgs_add_subgoal', { criterion: '阶段性目标' }, agent);
++  await host.callTool('fgs_commit', {}, agent);
++  const c3 = count();
++  assert.equal(c3.go, c2.go + 1);
++  await host.callTool('fgs_drop_subgoal', { goalId: 'goal_sub_001', reason: '不需要了' }, agent);
++  await host.callTool('fgs_commit', {}, agent);
++  const c4 = count();
++  assert.equal(c4.go, c3.go, 'drop_subgoal 不得删除节点');
++  assert.equal(c4.f, c0.f, '全程没有 fact 被删除');
++});
++
++/* ------------------------------------------- 显式派发（v2：Step↔Run 绑定）*/
++
++test('v2：接手别人的 step 必须显式 fgs_claim_step（不隐式认领）', async () => {
++  const { host, agent, cwd } = boot({ stepLeaseMs: 0 }); // 关掉租约 ⇒ 任何人可接手
++  await seed(host, agent);
++  await host.callTool('fgs_commit', {
++    operations: [{ op: 'open_step', action: '探路', from: ['fact_origin'] }],
++  }, agent);
++
++  // B：图上有 open step，但**没有派发给它** ⇒ 必须是 Decide（不得自动变成 Execute）
++  const b = secondAgent(host, cwd);
++  host.ctx.setTurn(2);
++  const asDecide = (await host.callTool('fgs_status', {}, b)).text;
++  assert.match(asDecide, /Decide/, 'B 未持有 step ⇒ 必须仍是 Decide');
++
++  // 但 B 可以显式认领，认领后进入 Execute
++  assert.equal((await host.callTool('fgs_claim_step', { stepId: 'step_001' }, b)).ok, true);
++  const after = (await host.callTool('fgs_status', {}, b)).text;
++  assert.match(after, /Execute/, '认领后 B 应进入 Execute');
++  const g = fs.readFileSync(projectGraphPath(cwd), 'utf8');
++  assert.match(g, /owner:\s*"?sess-b"?/, '认领必须把 owner 写进图（可审计的派发边）');
++});
++
++/* --------------------------------- v2：Decide 必须能在有 open step 时工作 */
++
++test('v2：图上存在 open step 时，仍必须能执行 Decide 职责（否则图会僵死）', async () => {
++  const { host, agent } = boot();
++  await seed(host, agent);
++  await host.callTool('fgs_commit', {
++    operations: [{ op: 'open_step', action: '第一步', from: ['fact_origin'] }],
++  }, agent);
++  // 此刻本会话持有 step_001（Execute）。但它仍需要能补规划 —— 这正是 v2
++  // 「图有变化时触发 Decide」的语义。开第二个 step 是 Decide 的职责。
++  const second = await host.callTool('fgs_open_step', { action: '第二步', from: ['fact_origin'] }, agent);
++  assert.equal(second.ok, true, `持有 step 时开新 step 应可达（旧实现会被角色门拒）: ${second.text}`);
++});
+--- a/tests/plugin.test.mjs
++++ fgs-fix/tests/plugin.test.mjs	2026-10-13 09:47:07.248180046 +0800
+@@ -105,7 +105,7 @@
+   assert.equal(opened.ok, true, opened.text);
+ });
+ 
+-test('open step 出现后 → Execute：规划工具被硬拒，环境工具与提交工具放开', async () => {
++test('open step 出现后 → Execute：goal 级判断仍被硬拒，图操作与环境工具放开（v2）', async () => {
+   const { host, agent } = boot();
+   await seed(host, agent);
+   await host.callTool('fgs_open_step', { action: '扫端口', from: ['fact_origin'], priority: 'high' }, agent);
+@@ -118,9 +118,10 @@
+   assert.equal(illegal.ok, false);
+   assert.match(illegal.text, /Execute 轮不得调用/);
+ 
+-  const illegalOpen = await host.callTool('fgs_open_step', { action: 'x', from: ['fact_origin'] }, agent);
+-  assert.equal(illegalOpen.ok, false);
+-  assert.match(illegalOpen.text, /Execute 轮不得调用/);
++  // v2：Decide 的职责是「图有变化时」对 Step 增删/调整优先级 —— 而这必然发生在有 open step
++  // 的时候。因此「操作 FGS 图」的工具在 Execute 轮同样放行（它们只动共享记忆，不动世界状态）。
++  const allowedOpen = await host.callTool('fgs_open_step', { action: 'x', from: ['fact_origin'] }, agent);
++  assert.equal(allowedOpen.ok, true, 'v2：Execute 轮也必须能补规划，否则图会僵死');
+ 
+   const allowed = await host.callTool('bash', {}, agent);
+   assert.equal(allowed.ok, true);
+@@ -290,7 +291,11 @@
+   //（旧 HTTP 路由继续响应、旧 context 继续注入、旧监听继续收紧新会话）。
+   const { host } = boot();
+   assert.equal(host.effects.length, 1, '只登记一个总清理 effect');
+-  assert.equal(host.tools.size, 13, '12 个 fgs_* + 假宿主自带的 bash');
++  // 不写死数量：随 v2 补齐（Sub Goal / Finding / claim）工具面会增长。
++  // 真正要守的两条是「除宿主的 bash 外全部是 fgs_*」和「卸载后全部撤销」。
++  const fgsTools = [...host.tools.keys()].filter((n) => n.startsWith('fgs_'));
++  assert.ok(fgsTools.length >= 15, `至少 15 个 fgs_*（实际 ${fgsTools.length}: ${fgsTools.join(',')}）`);
++  assert.equal(host.tools.size, fgsTools.length + 1, '除 fgs_* 外只有假宿主的 bash');
+   assert.equal(host.guards.length, 1);
+   assert.equal(host.sections.length, 1);
+   assert.equal(host.contexts.length, 1);
+--- a/tests/contract_fixes.test.mjs
++++ fgs-fix/tests/contract_fixes.test.mjs	2026-10-13 09:47:53.992180716 +0800
+@@ -208,7 +208,7 @@
+ 
+ /* ----------------------------------------------------- §1/§2 ID 与 Goal */
+ 
+-test('§2：validate 拒绝非 goal_final 的 goal、kind=sub、以及非法 step id', () => {
++test('§2/v2：Sub Goal 合法（kind=sub + parentId），非法 goal id 与非法 step id 仍被拒', () => {
+   const store = new GraphStore(tmpDir());
+   store.ensureDir();
+   fs.writeFileSync(store.graphPath, [
+@@ -221,7 +221,15 @@
+     '  kind: "final"',
+     '  criterion: "c"',
+     '  createdAt: "2026-01-01T00:00:00.000Z"',
+-    '- id: "goal_sub"',
++    // v2：Sub Goal 是一等公民 —— id 须 goal_xxx、kind 须 sub、parentId 须已存在
++    '- id: "goal_sub_001"',
++    '  kind: "sub"',
++    '  criterion: "阶段目标"',
++    '  createdAt: "2026-01-01T00:00:00.000Z"',
++    '  parentId: "goal_final"',
++    '  state: "open"',
++    // 非法：id 不符合 goal_xxx
++    '- id: "goalsub"',
+     '  kind: "sub"',
+     '  criterion: "c"',
+     '  createdAt: "2026-01-01T00:00:00.000Z"',
+@@ -236,7 +244,8 @@
+     '',
+   ].join('\n'), 'utf8');
+   const errs = store.validate(store.load());
+-  assert.ok(errs.some((e) => /goal id 非法/.test(e)), `应拒 goal_sub: ${errs.join(' | ')}`);
++  assert.ok(!errs.some((e) => /goal_sub_001/.test(e)), `合法的 Sub Goal 不应被拒: ${errs.join(' | ')}`);
++  assert.ok(errs.some((e) => /Sub Goal id 非法/.test(e)), `应拒 goalsub: ${errs.join(' | ')}`);
+   assert.ok(errs.some((e) => /step id 非法/.test(e)), `应拒 step_abc: ${errs.join(' | ')}`);
+   assert.throws(() => store.save(store.load()), /拒写/);
+ });

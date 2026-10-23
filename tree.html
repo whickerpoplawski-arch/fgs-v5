@@ -1,0 +1,719 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>FGS Tree · live</title>
+<style>
+  :root{
+    --bg:#ffffff; --panel:#fbfbfc; --line:#e7e8ea; --line-soft:#eff0f2;
+    --ink:#0f1115; --ink-2:#4a4f55; --ink-3:#8b9096;
+    --blue:#5b8def; --blue-bg:#eef3fe;
+    --green:#22a06b; --green-bg:#e9f7f0;
+    --red:#e5484d; --red-bg:#fdeeee;
+    --amber:#e08a00; --amber-bg:#fff5e2;
+    --purple:#8b5cf6; --purple-bg:#f3eefe;
+    --slate:#6b7280; --slate-bg:#f1f2f4;
+    --shadow:0 1px 2px rgba(16,24,40,.06),0 1px 3px rgba(16,24,40,.04);
+  }
+  *{box-sizing:border-box}
+  html,body{height:100%;margin:0}
+  body{
+    font:13px/1.45 -apple-system,"Segoe UI",system-ui,"Droid Sans Fallback","Noto Sans CJK SC",sans-serif;
+    color:var(--ink); background:var(--bg); overflow:hidden;
+  }
+  .app{display:grid;grid-template-rows:38px 1fr;height:100%}
+
+  /* ---------- 顶部 tab 条 ---------- */
+  .tabs{display:flex;align-items:center;gap:6px;padding:0 10px;border-bottom:1px solid var(--line);background:var(--panel)}
+  .tab{display:flex;align-items:center;gap:6px;height:26px;padding:0 10px;border-radius:6px;color:var(--ink-3);font-size:12px;cursor:default}
+  .tab.on{background:#fff;border:1px solid var(--line);color:var(--ink);box-shadow:var(--shadow)}
+  .tab .x{color:var(--ink-3);margin-left:4px}
+  .live{display:inline-flex;align-items:center;gap:5px;font-size:11px;color:var(--green);
+        background:var(--green-bg);border:1px solid #cdeadd;border-radius:20px;padding:1px 8px}
+  .dot{width:6px;height:6px;border-radius:50%;background:currentColor}
+  .dot.pulse{animation:p 2s infinite}
+  @keyframes p{0%,100%{opacity:1}50%{opacity:.25}}
+
+  .main{display:grid;grid-template-columns:minmax(360px,440px) 1fr;min-height:0}
+
+  /* ---------- 左侧 ---------- */
+  .side{border-right:1px solid var(--line);display:flex;flex-direction:column;min-height:0;background:#fff}
+  .side-head{padding:14px 16px 10px;border-bottom:1px solid var(--line-soft)}
+  .eyebrow{display:flex;align-items:center;gap:8px;font-size:11px;letter-spacing:.04em;color:var(--ink-3);text-transform:uppercase}
+  .eyebrow b{color:var(--ink);font-size:15px;letter-spacing:0;text-transform:none;font-weight:650}
+  .kv{margin-top:10px;display:grid;gap:6px}
+  .kv .row{display:grid;grid-template-columns:82px 1fr;gap:8px;font-size:12px;align-items:start}
+  .kv .k{color:var(--ink-3)}
+  .kv .v{color:var(--ink-2);word-break:break-word}
+  .kv .v.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:11.5px}
+
+  .counts{display:flex;gap:16px;padding:10px 16px;border-bottom:1px solid var(--line-soft);font-size:12px;color:var(--ink-2)}
+  .counts b{color:var(--ink);font-weight:650;font-size:13px}
+  .counts .warn b{color:var(--amber)}
+
+  .chips{display:flex;flex-wrap:wrap;gap:6px;padding:10px 16px;border-bottom:1px solid var(--line-soft)}
+  .chip{font-size:11px;padding:1px 8px;border-radius:20px;background:var(--slate-bg);color:var(--slate);border:1px solid transparent}
+  .chip.blue{background:var(--blue-bg);color:var(--blue)}
+  .chip.green{background:var(--green-bg);color:var(--green)}
+  .chip.red{background:var(--red-bg);color:var(--red)}
+  .chip.amber{background:var(--amber-bg);color:var(--amber)}
+  .chip.purple{background:var(--purple-bg);color:var(--purple)}
+
+  .meters{display:flex;gap:18px;padding:10px 16px;border-bottom:1px solid var(--line-soft);font-size:12px;color:var(--ink-3)}
+  .meters b{color:var(--ink);font-weight:650}
+
+  .list{overflow:auto;padding:8px 10px 14px;min-height:0}
+  .list h4{margin:10px 6px 6px;font-size:11px;letter-spacing:.05em;color:var(--ink-3);text-transform:uppercase;font-weight:600}
+  .card{display:grid;grid-template-columns:3px 1fr;gap:0;background:#fff;border:1px solid var(--line);
+        border-radius:8px;margin:0 0 7px;cursor:pointer;overflow:hidden;box-shadow:var(--shadow);transition:.12s}
+  .card:hover{border-color:#cfd3d8;transform:translateY(-1px)}
+  .card.sel{border-color:var(--blue);box-shadow:0 0 0 3px rgba(91,141,239,.15)}
+  .card .strip{background:var(--slate)}
+  .card.c-blue .strip{background:var(--blue)} .card.c-green .strip{background:var(--green)}
+  .card.c-red .strip{background:var(--red)}   .card.c-amber .strip{background:var(--amber)}
+  .card.c-purple .strip{background:var(--purple)}
+  .card .body{padding:8px 10px 9px;min-width:0}
+  .card .top{display:flex;align-items:center;gap:7px;min-width:0}
+  .card .id{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:11px;color:var(--ink-2);font-weight:600}
+  .card .st{font-size:10px;letter-spacing:.03em;padding:0 6px;border-radius:4px;white-space:nowrap}
+  .st.blue{background:var(--blue-bg);color:var(--blue)} .st.green{background:var(--green-bg);color:var(--green)}
+  .st.red{background:var(--red-bg);color:var(--red)}   .st.amber{background:var(--amber-bg);color:var(--amber)}
+  .st.slate{background:var(--slate-bg);color:var(--slate)} .st.purple{background:var(--purple-bg);color:var(--purple)}
+  .card .tt{margin-top:3px;font-size:12.5px;color:var(--ink);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .card .sub{margin-top:2px;font-size:11px;color:var(--ink-3);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .flash{animation:fl 1.6s ease-out}
+  @keyframes fl{0%{background:#fffbe6}100%{background:#fff}}
+
+  /* ---------- 右侧画布 ---------- */
+  .stage{position:relative;min-width:0;background:
+      radial-gradient(circle at 1px 1px,#e9ebee 1px,transparent 0) 0 0/22px 22px,#fcfcfd;overflow:hidden}
+  .stage-top{position:absolute;inset:0 0 auto 0;height:44px;display:flex;align-items:center;gap:10px;padding:0 14px;
+             background:rgba(255,255,255,.92);backdrop-filter:blur(6px);border-bottom:1px solid var(--line);z-index:4}
+  .crumb{display:flex;align-items:center;gap:6px;font-size:12px;color:var(--ink-3)}
+  .crumb a{color:var(--blue);text-decoration:none;cursor:pointer}
+  .crumb .cur{color:var(--ink);font-weight:600}
+  .spacer{flex:1}
+  .btn{height:26px;padding:0 10px;border:1px solid var(--line);border-radius:6px;background:#fff;color:var(--ink-2);
+       font-size:12px;cursor:pointer;box-shadow:var(--shadow)}
+  .btn:hover{border-color:#cfd3d8;color:var(--ink)}
+  .btn.on{background:var(--blue-bg);border-color:#c9d8fb;color:var(--blue)}
+
+  .viewport{position:absolute;inset:44px 0 0 0;overflow:hidden;cursor:grab}
+  .viewport.drag{cursor:grabbing}
+  .world{position:absolute;left:0;top:0;transform-origin:0 0;will-change:transform}
+  #edges{position:absolute;left:0;top:0;overflow:visible;pointer-events:none}
+  .node{position:absolute;background:#fff;border:1px solid var(--line);border-radius:7px;box-shadow:var(--shadow);
+        overflow:hidden;cursor:pointer;transition:box-shadow .12s,border-color .12s}
+  .node:hover{border-color:#c9ced4;box-shadow:0 3px 10px rgba(16,24,40,.1)}
+  .node.sel{border-color:var(--blue);box-shadow:0 0 0 3px rgba(91,141,239,.18)}
+  .node .bar{position:absolute;left:0;top:0;bottom:0;width:3px}
+  .node .in{padding:7px 9px 8px 11px}
+  .node .l1{display:flex;align-items:center;gap:6px}
+  .node .id{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:10.5px;color:var(--ink-2);font-weight:600}
+  .node .tt{font-size:12.5px;color:var(--ink);margin-top:2px;line-height:1.35;
+            display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+  .node .sub{font-size:10.5px;color:var(--ink-3);margin-top:2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .node.root{background:linear-gradient(180deg,#fff,#f7f9ff);border-color:#cfdcf8}
+  .node.compact .in.row{display:flex;align-items:center;gap:7px;height:100%;padding:0 9px 0 11px}
+  .node.compact .id{flex:none}
+  .node.compact .tt.one{flex:1;min-width:0;font-size:12px;color:var(--ink);overflow:hidden;
+      text-overflow:ellipsis;white-space:nowrap;display:block;margin:0}
+  .node.compact .st{flex:none}
+  .node.group .grp-n{color:var(--ink-3);font-size:11px}
+  .node.group .sub{margin-top:1px}
+  .node.dim{opacity:.28;filter:saturate(.4)}
+
+  .toolbar{position:absolute;right:12px;top:56px;z-index:4;display:flex;flex-direction:column;gap:6px}
+  .toolbar .btn{width:28px;height:28px;padding:0;display:grid;place-items:center;font-size:14px}
+  .hint{position:absolute;left:14px;bottom:10px;z-index:4;font-size:11px;color:var(--ink-3);
+        background:rgba(255,255,255,.9);border:1px solid var(--line);border-radius:6px;padding:3px 8px}
+  .zoom-badge{position:absolute;right:12px;bottom:10px;z-index:4;font-size:11px;color:var(--ink-3);
+        background:rgba(255,255,255,.9);border:1px solid var(--line);border-radius:6px;padding:3px 8px;
+        font-family:ui-monospace,Menlo,monospace}
+
+  .detail{position:absolute;left:0;right:0;bottom:0;z-index:5;max-height:44%;overflow:auto;
+          background:rgba(255,255,255,.97);backdrop-filter:blur(8px);border-top:1px solid var(--line);
+          box-shadow:0 -8px 24px rgba(16,24,40,.08);transform:translateY(101%);transition:transform .18s ease}
+  .detail.open{transform:none}
+  .detail .dh{display:flex;align-items:center;gap:8px;padding:9px 14px;border-bottom:1px solid var(--line-soft);position:sticky;top:0;background:#fff}
+  .detail .dh b{font-size:13px}
+  .detail .dh .meta{font-size:11px;color:var(--ink-3);font-family:ui-monospace,Menlo,monospace}
+  .detail .db{padding:10px 14px 16px;display:grid;gap:8px}
+  .detail .lbl{font-size:10.5px;letter-spacing:.05em;color:var(--ink-3);text-transform:uppercase;font-weight:600}
+  .detail pre{margin:0;white-space:pre-wrap;word-break:break-word;font:12px/1.5 ui-monospace,Menlo,Consolas,monospace;
+              background:var(--panel);border:1px solid var(--line-soft);border-radius:6px;padding:8px 10px;max-height:220px;overflow:auto}
+  .detail .txt{font-size:12.5px;color:var(--ink-2);line-height:1.55}
+  .empty{padding:60px 20px;text-align:center;color:var(--ink-3);font-size:12px}
+  .kbd{font-family:ui-monospace,Menlo,monospace;font-size:10.5px;background:var(--slate-bg);border-radius:4px;padding:1px 5px}
+</style>
+</head>
+<body>
+<div class="app">
+  <div class="tabs">
+    <div class="tab">⌘ Tree</div>
+    <div class="tab on">🌳 FGS Tree <span class="live"><span class="dot pulse"></span>live</span><span class="x">×</span></div>
+    <div class="spacer"></div>
+    <div class="tab" id="updated">—</div>
+  </div>
+
+  <div class="main">
+    <aside class="side">
+      <div class="side-head">
+        <div class="eyebrow"><span>FGS blackboard</span><b id="runName">run4</b></div>
+        <div class="kv">
+          <div class="row"><div class="k">scope</div><div class="v" id="kScope">—</div></div>
+          <div class="row"><div class="k">objective</div><div class="v" id="kGoal">—</div></div>
+          <div class="row"><div class="k">note</div><div class="v" id="kNote">—</div></div>
+        </div>
+      </div>
+
+      <div class="counts" id="counts"></div>
+      <div class="chips" id="chips"></div>
+      <div class="meters" id="meters"></div>
+      <div class="list" id="list"></div>
+    </aside>
+
+    <section class="stage">
+      <div class="stage-top">
+        <div class="crumb" id="crumb"></div>
+        <div class="spacer"></div>
+        <button class="btn" id="btnLive">自动刷新 2min</button>
+        <button class="btn" id="btnRefresh">立即刷新</button>
+      </div>
+
+      <div class="viewport" id="viewport">
+        <div class="world" id="world">
+          <svg id="edges"></svg>
+          <div id="nodes"></div>
+        </div>
+      </div>
+
+      <div class="toolbar">
+        <button class="btn" id="zin" title="放大">+</button>
+        <button class="btn" id="zout" title="缩小">−</button>
+        <button class="btn" id="zfit" title="适应窗口">⛶</button>
+      </div>
+      <div class="hint">拖拽平移 · 滚轮缩放 · 点击卡片查看详情</div>
+      <div class="zoom-badge" id="zbadge">100%</div>
+
+      <div class="detail" id="detail">
+        <div class="dh"><b id="dTitle">—</b><span class="meta" id="dMeta"></span><div class="spacer"></div>
+          <button class="btn" id="dClose">关闭</button></div>
+        <div class="db" id="dBody"></div>
+      </div>
+    </section>
+  </div>
+</div>
+
+<script>
+/* ============================== 状态 ============================== */
+const S = {
+  model: null,          // /api/graph 原始模型
+  mode: 'overview',     // overview | project
+  projectId: null,
+  selected: null,       // {kind:'fact'|'step'|'goal'|'project', id}
+  view: { x: 40, y: 40, k: 1 },
+  auto: true,
+  timer: null,
+  lastSig: '',
+};
+const INTERVAL_MS = 120000;   // ← 每 2 分钟
+const $ = (id) => document.getElementById(id);
+
+const COLORS = {
+  confirmed: { c: 'blue', hex: '#5b8def' },
+  done: { c: 'green', hex: '#22a06b' },
+  open: { c: 'amber', hex: '#e08a00' },
+  dropped: { c: 'red', hex: '#e5484d' },
+  unfinished: { c: 'red', hex: '#e5484d' },
+  finding: { c: 'purple', hex: '#8b5cf6' },
+  result: { c: 'blue', hex: '#5b8def' },
+  solved: { c: 'green', hex: '#22a06b' },
+  deferred: { c: 'amber', hex: '#e08a00' },
+  running: { c: 'blue', hex: '#5b8def' },
+  goal: { c: 'slate', hex: '#6b7280' },
+};
+
+const esc = (s) => String(s ?? '').replace(/[&<>"]/g, (ch) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[ch]));
+const clip = (s, n) => { const t = String(s ?? '').replace(/\s+/g, ' ').trim(); return t.length > n ? t.slice(0, n) + '…' : t; };
+
+/* ============================== 取数 ============================== */
+const DATA_URL = '__FGS_TREE_BASE__/data';
+
+async function loadModel() {
+  const res = await fetch(DATA_URL, { cache: 'no-store' });
+  if (!res.ok) throw new Error('HTTP ' + res.status);
+  const model = await res.json();
+  const sig = JSON.stringify([model.totals, model.projects.map((p) => [p.id, p.mtime, p.stats])]);
+  const changed = sig !== S.lastSig && S.lastSig !== '';
+  S.lastSig = sig;
+  S.model = model;
+  if (changed) flashChanged();
+  renderAll();
+  $('updated').textContent = '更新于 ' + new Date(model.generatedAt).toLocaleTimeString('zh-CN', { hour12: false });
+}
+
+/* ============================== 左侧面板 ============================== */
+function renderLeft() {
+  const m = S.model;
+  if (!m) return;
+  const t = m.totals;
+  $('runName').textContent = m.root.split('/').filter(Boolean).slice(-2)[0] || 'run';
+  $('kScope').textContent = `${t.workers} 个 worker · ${t.projects} 道题（${m.root}）`;
+  $('kGoal').textContent = 'Fact → Step → Fact 黑板：每轮只认领一个 step，产出 fact 后再规划';
+  $('kNote').textContent = m.root;
+
+  $('counts').innerHTML = `
+    <div><b>${t.projects}</b> 题</div>
+    <div class="${t.open ? 'warn' : ''}"><b>${t.open}</b> open</div>
+    <div><b>${t.solved}</b> solved</div>
+    <div><b>${t.unfinished}</b> unfinished</div>`;
+
+  const chips = [
+    ['@high ' + t.high, 'amber'],
+    ['@facts ' + t.facts, 'blue'],
+    ['@steps ' + t.steps, 'green'],
+    ['@goals ' + t.goals, 'slate'],
+    ['@findings ' + t.findings, 'purple'],
+    ['@dropped ' + t.dropped, 'red'],
+  ];
+  $('chips').innerHTML = chips.map(([x, c]) => `<span class="chip ${c}">${esc(x)}</span>`).join('');
+
+  $('meters').innerHTML = `
+    <div>Tree <b>${t.facts + t.steps}</b></div>
+    <div>Facts <b>${t.facts}</b></div>
+    <div>Steps <b>${t.steps}</b></div>
+    <div>Goals <b>${t.goals}</b></div>`;
+
+  const list = $('list');
+  if (S.mode === 'overview') {
+    list.innerHTML = `<h4>题目 (${m.projects.length})</h4>` + m.projects.map((p) => projectCard(p)).join('');
+  } else {
+    const p = current();
+    if (!p) { list.innerHTML = '<div class="empty">没有选中题目</div>'; return; }
+    const steps = p.steps.slice().sort((a, b) => String(a.createdAt).localeCompare(String(b.createdAt)));
+    const facts = p.facts.slice().sort((a, b) => String(a.createdAt).localeCompare(String(b.createdAt)));
+    list.innerHTML = `<h4>${esc(p.id)} · facts (${facts.length})</h4>` +
+      facts.map((f) => sideCard({
+        kind: 'fact', id: f.id, sel: isSel('fact', f.id),
+        status: f.kind === 'unfinished' ? 'unfinished' : (f.findingType || 'confirmed'),
+        title: f.title, sub: f.producedBy ? '← ' + f.producedBy : '',
+      })).join('') +
+      `<h4>steps (${steps.length})</h4>` +
+      steps.map((s) => sideCard({
+        kind: 'step', id: s.id, sel: isSel('step', s.id),
+        status: s.state, title: s.action,
+        sub: [s.priority, s.to ? '→ ' + s.to : '未收束', s.from.length ? 'from ' + s.from.join(',') : ''].filter(Boolean).join(' · '),
+      })).join('');
+  }
+}
+
+function projectCard(p) {
+  const st = p.stats.satisfied || p.state === 'solved' ? 'solved'
+    : p.state === 'deferred' ? 'deferred' : (p.stats.open ? 'open' : 'done');
+  const color = (COLORS[st] ?? COLORS.running).c;
+  return `<div class="card c-${color} ${isSel('project', p.id) ? 'sel' : ''}" data-kind="project" data-id="${esc(p.id)}">
+    <div class="strip"></div>
+    <div class="body">
+      <div class="top"><span class="id">${esc(p.id)}</span><span class="st ${color}">${esc(st)}</span></div>
+      <div class="tt">${esc(clip(p.title || p.origin.brief || p.id, 90))}</div>
+      <div class="sub">${p.stats.facts} facts · ${p.stats.steps} steps · ${p.stats.open} open${p.duplicated ? ' · 重跑' : ''}</div>
+    </div></div>`;
+}
+
+function sideCard({ kind, id, status, title, sub, sel }) {
+  const color = (COLORS[status] ?? COLORS.result).c;
+  return `<div class="card c-${color} ${sel ? 'sel' : ''}" data-kind="${kind}" data-id="${esc(id)}">
+    <div class="strip"></div>
+    <div class="body">
+      <div class="top"><span class="id">${esc(id)}</span><span class="st ${color}">${esc(status)}</span></div>
+      <div class="tt">${esc(clip(title, 110))}</div>
+      ${sub ? `<div class="sub">${esc(clip(sub, 90))}</div>` : ''}
+    </div></div>`;
+}
+
+/* ============================== 画布布局 ============================== */
+const CARD_W = 250, CARD_H = 58, GAP_X = 130, GAP_Y = 24;
+
+function current() { return S.model?.projects.find((p) => p.id === S.projectId) ?? null; }
+
+/** 计算节点与边。返回 {nodes:[{key,kind,id,x,y,w,h,...}], edges:[{from,to,color}]} */
+function layout() {
+  if (S.mode === 'overview') return layoutOverview();
+  return layoutProject();
+}
+
+function layoutOverview() {
+  const projects = S.model.projects;
+  const groups = new Map();
+  for (const p of projects) {
+    const g = p.id.includes('-') ? p.id.split('-')[0] : p.id;
+    (groups.get(g) ?? groups.set(g, []).get(g)).push(p);
+  }
+  // 按题数降序，贪心填 3 列，保证每列高度接近
+  const list = [...groups.entries()].sort((a, b) => b[1].length - a[1].length);
+  const cols = [[], [], []], load = [0, 0, 0];
+  for (const [g, arr] of list) {
+    const i = load.indexOf(Math.min(...load));
+    cols[i].push([g, arr]); load[i] += arr.length + 1.4;
+  }
+
+  const COL_W = 300, COL_GAP = 34, HEAD_H = 52, ROW_H = 34, ROW_GAP = 6, CLUSTER_GAP = 18;
+  const nodes = [], edges = [];
+  let maxY = 0;
+
+  cols.forEach((groupsInCol, ci) => {
+    const colX = ci * (COL_W + COL_GAP);
+    let y = 0;
+    for (const [g, arr] of groupsInCol) {
+      nodes.push({
+        key: 'g:' + g, kind: 'group', id: g, x: colX, y, w: COL_W, h: HEAD_H,
+        title: g, color: '#8b5cf6',
+        sub: `${arr.length} 题 · ${arr.filter((p) => p.stats.open).length} open · ${arr.filter((p) => p.stats.satisfied || p.state === 'solved').length} solved`,
+      });
+      y += HEAD_H + ROW_GAP;
+      arr.forEach((p) => {
+        const key = 'p:' + p.worker + '/' + p.id;
+        const st = p.stats.satisfied || p.state === 'solved' ? 'solved'
+          : p.state === 'deferred' ? 'deferred' : (p.stats.open ? 'open' : 'done');
+        const color = (COLORS[st] ?? COLORS.running).hex;
+        nodes.push({
+          key, kind: 'project', id: p.id, x: colX + 10, y, w: COL_W - 10, h: ROW_H,
+          title: p.title || p.id, sub: `${p.stats.facts} facts · ${p.stats.steps} steps`,
+          status: st, color, project: p,
+        });
+        edges.push({ from: 'g:' + g, to: key, color: '#e2e6ec', soft: true, rail: true });
+        y += ROW_H + ROW_GAP;
+      });
+      y += CLUSTER_GAP;
+      maxY = Math.max(maxY, y);
+    }
+  });
+  return { nodes, edges, width: 3 * (COL_W + COL_GAP), height: Math.max(maxY, 400) };
+}
+
+function layoutProject() {
+  const p = current();
+  if (!p) return { nodes: [], edges: [], width: 400, height: 300 };
+  const facts = [{ id: 'fact_origin', title: '题目信息', kind: 'origin', createdAt: p.createdAt }, ...p.facts];
+  const byFact = new Map(facts.map((f) => [f.id, f]));
+  const steps = p.steps;
+
+  const kindOfFact = (f) => (f.kind === 'unfinished' ? 'unfinished' : (f.findingType ? 'finding' : 'result'));
+  const depth = new Map();
+  depth.set('fact_origin', 0);
+  // 迭代到稳定（图可能有乱序写入）
+  for (let pass = 0; pass < 24; pass++) {
+    let changed = false;
+    for (const f of facts) {
+      const d = depth.get(f.id);
+      if (d === undefined) continue;
+      for (const s of steps) if (s.from.includes(f.id) && (depth.get(s.id) ?? -1) < d + 1) { depth.set(s.id, d + 1); changed = true; }
+      const prod = steps.find((s) => s.to === f.id || (f.producedBy && s.id === f.producedBy));
+      if (prod && depth.get(prod.id) !== undefined && (depth.get(f.id) ?? -1) < depth.get(prod.id) + 1) {
+        depth.set(f.id, depth.get(prod.id) + 1); changed = true;
+      }
+    }
+    for (const s of steps) {
+      const d = depth.get(s.id);
+      if (d === undefined) continue;
+      if (s.to && (depth.get(s.to) ?? -1) < d + 1) { depth.set(s.to, d + 1); changed = true; }
+    }
+    if (!changed) break;
+  }
+  for (const f of facts) if (!depth.has(f.id)) depth.set(f.id, 0);
+  for (const s of steps) if (!depth.has(s.id)) depth.set(s.id, 1);
+
+  const cols = new Map();
+  const push = (d, item) => (cols.get(d) ?? cols.set(d, []).get(d)).push(item);
+
+  push(depth.get('fact_origin'), { kind: 'fact', data: facts[0] });
+  for (const s of steps) push(depth.get(s.id), { kind: 'step', data: s });
+  for (const f of p.facts) push(depth.get(f.id), { kind: 'fact', data: f });
+
+  const nodes = [], edges = [];
+  const byKey = new Map();
+  const colKeys = [...cols.keys()].sort((a, b) => a - b);
+  const maxRows = Math.max(...colKeys.map((d) => cols.get(d).length), 1);
+  const colH = maxRows * (CARD_H + GAP_Y);
+  const nodeW = CARD_W, nodeH = CARD_H;
+
+  for (const d of colKeys) {
+    const arr = cols.get(d).sort((a, b) => String(a.data.createdAt ?? '').localeCompare(String(b.data.createdAt ?? '')));
+    const h = arr.length * (CARD_H + GAP_Y) - GAP_Y;
+    const y0 = (colH - h) / 2;
+    arr.forEach((it, i) => {
+      const key = (it.kind === 'fact' ? 'f:' : 's:') + it.data.id;
+      let status, color;
+      if (it.kind === 'fact') {
+        const k = it.data.id === 'fact_origin' ? 'origin' : kindOfFact(it.data);
+        status = k === 'origin' ? 'origin' : (k === 'unfinished' ? 'unfinished' : (it.data.findingType || 'confirmed'));
+        color = k === 'origin' ? '#6b7280' : (k === 'unfinished' ? '#e5484d' : (k === 'finding' ? '#8b5cf6' : '#5b8def'));
+      } else {
+        status = it.data.state; color = (COLORS[it.data.state] ?? COLORS.open).hex;
+      }
+      const node = {
+        key, kind: it.kind, id: it.data.id, x: d * (nodeW + GAP_X), y: y0 + i * (CARD_H + GAP_Y),
+        w: nodeW, h: nodeH, status, color,
+        title: it.kind === 'fact' ? (it.data.title || it.data.id) : it.data.action,
+        sub: it.kind === 'fact'
+          ? (it.data.producedBy ? `← ${it.data.producedBy}` : (it.data.id === 'fact_origin' ? '题目种子' : ''))
+          : `${it.data.priority}${it.data.to ? ' → ' + it.data.to : ' · 未收束'}`,
+        data: it.data,
+      };
+      nodes.push(node); byKey.set(key, node);
+    });
+  }
+
+  for (const s of p.steps) {
+    const sk = 's:' + s.id;
+    for (const from of s.from) {
+      if (byKey.has('f:' + from)) edges.push({ from: 'f:' + from, to: sk, color: byKey.get('f:' + from).color });
+    }
+    if (s.to && byKey.has('f:' + s.to)) edges.push({ from: sk, to: 'f:' + s.to, color: byKey.get(sk).color });
+  }
+  // producedBy 兜底：step 被 drop（没有 to）时，它产出的 fact 仍应挂在该 step 下
+  for (const f of p.facts) {
+    const sk = 's:' + f.producedBy, fk = 'f:' + f.id;
+    if (!f.producedBy || !byKey.has(sk) || !byKey.has(fk)) continue;
+    if (!edges.some((e) => e.from === sk && e.to === fk)) {
+      edges.push({ from: sk, to: fk, color: byKey.get(sk).color });
+    }
+  }
+  // 孤立 fact（没有 producedBy / 没有 step 指向）连到 origin，保持一棵树
+  for (const f of p.facts) {
+    const k = 'f:' + f.id;
+    if (!edges.some((e) => e.to === k || e.from === k)) edges.push({ from: 'f:fact_origin', to: k, color: '#d6dcf5', soft: true });
+  }
+
+  return { nodes, edges, width: (colKeys.at(-1) + 1) * (nodeW + GAP_X), height: Math.max(colH, 300) };
+}
+
+/* ============================== 渲染 ============================== */
+function renderAll() { renderLeft(); renderCanvas(); renderCrumb(); }
+
+function renderCrumb() {
+  const p = current();
+  if (S.mode === 'overview') {
+    $('crumb').innerHTML = `<span class="cur">run4</span> <span>·</span> <span>${S.model.totals.projects} 题 · ${S.model.totals.steps} steps</span>`;
+  } else {
+    $('crumb').innerHTML = `<a data-nav="root">run4</a> <span>›</span> <span class="cur">${esc(p?.id ?? '')}</span>
+      <span>·</span> <span>${p ? `${p.stats.facts} facts · ${p.stats.steps} steps · ${p.stats.open} open` : ''}</span>`;
+    $('crumb').querySelector('[data-nav=root]').onclick = () => { S.mode = 'overview'; S.projectId = null; S.selected = null; fit(); renderAll(); };
+  }
+}
+
+function renderCanvas() {
+  const { nodes, edges, width, height } = layout();
+  const world = $('world');
+  world.style.width = width + 'px';
+  world.style.height = height + 'px';
+  const svg = $('edges');
+  svg.setAttribute('width', width); svg.setAttribute('height', height);
+  const pos = new Map(nodes.map((n) => [n.key, n]));
+
+  const paths = [];
+  for (const e of edges) {
+    const a = pos.get(e.from), b = pos.get(e.to);
+    if (!a || !b) continue;
+    if (e.rail) {
+      // 簇头 → 题目行：贴左侧的直角导轨
+      const rx = a.x + 4, ry1 = a.y + a.h, ry2 = b.y + b.h / 2;
+      paths.push(`<path d="M${rx} ${ry1} V${ry2} H${b.x}" fill="none" stroke="${e.color}" stroke-width="1.2" opacity=".9"/>`);
+      continue;
+    }
+    const x1 = a.x + a.w, y1 = a.y + a.h / 2;
+    const x2 = b.x, y2 = b.y + b.h / 2;
+    const dx = Math.max(40, (x2 - x1) * 0.55);
+    paths.push(`<path d="M${x1} ${y1} C${x1 + dx} ${y1}, ${x2 - dx} ${y2}, ${x2} ${y2}"
+      fill="none" stroke="${e.color}" stroke-width="1.4" opacity="${e.soft ? .45 : .8}"
+      ${e.soft ? 'stroke-dasharray="4 3"' : ''}/>`);
+  }
+  svg.innerHTML = paths.join('');
+
+  const sel = S.selected;
+  $('nodes').innerHTML = nodes.map((n) => {
+    const isSel = sel && ((sel.kind === 'project' && n.kind === 'project' && sel.id === n.id)
+      || (sel.kind === n.kind && sel.id === n.id));
+    const compact = n.h < 46;
+    const statusChip = n.status ? `<span class="st ${(COLORS[n.status] ?? COLORS.result).c}">${esc(n.status)}</span>` : '';
+    if (n.kind === 'group') {
+      return `<div class="node group ${isSel ? 'sel' : ''}" data-key="${esc(n.key)}" data-kind="${esc(n.kind)}" data-id="${esc(n.id)}"
+          style="left:${n.x}px;top:${n.y}px;width:${n.w}px;height:${n.h}px">
+          <div class="bar" style="background:${n.color}"></div>
+          <div class="in">
+            <div class="l1"><span class="id">${esc(n.id)}</span><span class="grp-n">${esc(n.title)} 组</span></div>
+            <div class="sub">${esc(clip(n.sub, 70))}</div>
+          </div></div>`;
+    }
+    if (compact) {
+      return `<div class="node compact ${isSel ? 'sel' : ''}" data-key="${esc(n.key)}" data-kind="${esc(n.kind)}" data-id="${esc(n.id)}"
+          style="left:${n.x}px;top:${n.y}px;width:${n.w}px;height:${n.h}px">
+          <div class="bar" style="background:${n.color}"></div>
+          <div class="in row">
+            <span class="id">${esc(n.id)}</span>
+            <span class="tt one">${esc(clip(n.title, 70))}</span>
+            ${statusChip}
+          </div></div>`;
+    }
+    return `<div class="node ${n.kind === 'root' ? 'root' : ''} ${isSel ? 'sel' : ''}"
+        data-key="${esc(n.key)}" data-kind="${esc(n.kind)}" data-id="${esc(n.id)}"
+        style="left:${n.x}px;top:${n.y}px;width:${n.w}px;height:${n.h}px">
+        <div class="bar" style="background:${n.color}"></div>
+        <div class="in">
+          <div class="l1"><span class="id">${esc(n.id)}</span>${statusChip}</div>
+          <div class="tt">${esc(clip(n.title, 80))}</div>
+          ${n.sub ? `<div class="sub">${esc(clip(n.sub, 60))}</div>` : ''}
+        </div></div>`;
+  }).join('');
+
+  applyView();
+}
+
+function applyView() {
+  $('world').style.transform = `translate(${S.view.x}px,${S.view.y}px) scale(${S.view.k})`;
+  $('zbadge').textContent = Math.round(S.view.k * 100) + '%';
+}
+
+function fit() {
+  const { nodes } = layout();
+  if (!nodes.length) return;
+  const minX = Math.min(...nodes.map((n) => n.x)), minY = Math.min(...nodes.map((n) => n.y));
+  const maxX = Math.max(...nodes.map((n) => n.x + n.w)), maxY = Math.max(...nodes.map((n) => n.y + n.h));
+  const vp = $('viewport').getBoundingClientRect();
+  const pad = 40;
+  const k = Math.min((vp.width - pad * 2) / Math.max(maxX - minX, 1), (vp.height - pad * 2) / Math.max(maxY - minY, 1), 1);
+  S.view.k = Math.max(0.12, k);
+  S.view.x = pad - minX * S.view.k + Math.max(0, (vp.width - pad * 2 - (maxX - minX) * S.view.k) / 2);
+  S.view.y = pad - minY * S.view.k + Math.max(0, (vp.height - pad * 2 - (maxY - minY) * S.view.k) / 2);
+  applyView();
+}
+
+/* ============================== 详情 ============================== */
+function isSel(kind, id) { return S.selected && S.selected.kind === kind && S.selected.id === id; }
+
+function select(kind, id) {
+  S.selected = { kind, id };
+  if (kind === 'project') { S.mode = 'project'; S.projectId = id; fit(); renderAll(); showDetail(kind, id); return; }
+  renderAll(); showDetail(kind, id);
+}
+
+function showDetail(kind, id) {
+  const d = $('detail'), body = $('dBody');
+  const p = current();
+  let title = id, meta = '', html = '';
+
+  if (kind === 'project') {
+    const pr = S.model.projects.find((x) => x.id === id);
+    if (!pr) return;
+    title = pr.id; meta = `${pr.worker} · ${pr.stats.facts} facts · ${pr.stats.steps} steps`;
+    html = `
+      <div><div class="lbl">objective / brief</div><div class="txt">${esc(clip(pr.origin.brief || pr.title, 600))}</div></div>
+      <div><div class="lbl">goal_final</div><div class="txt">${esc(pr.goal?.criterion || '—')}</div></div>
+      <div><div class="lbl">facts (${pr.facts.length})</div><pre>${esc(pr.facts.map((f) => `${f.id}  [${f.kind}]  ${clip(f.title, 90)}`).join('\n') || '—')}</pre></div>`;
+  } else if (kind === 'fact' && p) {
+    const f = id === 'fact_origin'
+      ? { id: 'fact_origin', title: '题目信息', content: JSON.stringify({ target: p.origin.target, brief: p.origin.brief }, null, 2), kind: 'origin', createdAt: p.createdAt }
+      : p.facts.find((x) => x.id === id);
+    if (!f) return;
+    title = f.id; meta = [f.kind, f.producedBy ? '← ' + f.producedBy : '', f.createdAt].filter(Boolean).join(' · ');
+    html = `
+      <div><div class="lbl">title</div><div class="txt">${esc(f.title)}</div></div>
+      <div><div class="lbl">content</div><pre>${esc(f.content || '—')}</pre></div>`;
+  } else if (kind === 'step' && p) {
+    const s = p.steps.find((x) => x.id === id);
+    if (!s) return;
+    title = s.id; meta = [s.state, s.priority, s.createdAt].filter(Boolean).join(' · ');
+    html = `
+      <div><div class="lbl">action</div><div class="txt">${esc(s.action)}</div></div>
+      <div><div class="lbl">from → to</div><pre>${esc(`from: ${s.from.join(', ') || '—'}\nto:   ${s.to || '未收束'}\nowner: ${s.owner || '—'}`)}</pre></div>
+      ${s.reason ? `<div><div class="lbl">reason</div><div class="txt">${esc(s.reason)}</div></div>` : ''}`;
+  }
+  $('dTitle').textContent = title;
+  $('dMeta').textContent = meta;
+  body.innerHTML = html;
+  d.classList.add('open');
+}
+
+/* ============================== 交互 ============================== */
+$('list').addEventListener('click', (e) => {
+  const card = e.target.closest('.card');
+  if (!card) return;
+  select(card.dataset.kind, card.dataset.id);
+});
+$('nodes').addEventListener('click', (e) => {
+  const node = e.target.closest('.node');
+  if (!node) return;
+  const { kind, id } = node.dataset;
+  if (kind === 'project') { S.mode = 'project'; S.projectId = id; S.selected = { kind: 'project', id }; fit(); renderAll(); showDetail('project', id); return; }
+  if (kind === 'group' || kind === 'root') { S.mode = 'overview'; S.projectId = null; S.selected = null; fit(); renderAll(); return; }
+  select(kind, id);
+});
+$('dClose').onclick = () => $('detail').classList.remove('open');
+
+const vp = $('viewport');
+let drag = null;
+vp.addEventListener('mousedown', (e) => {
+  if (e.target.closest('.node')) return;
+  drag = { x: e.clientX, y: e.clientY, vx: S.view.x, vy: S.view.y };
+  vp.classList.add('drag');
+});
+window.addEventListener('mousemove', (e) => {
+  if (!drag) return;
+  S.view.x = drag.vx + (e.clientX - drag.x);
+  S.view.y = drag.vy + (e.clientY - drag.y);
+  applyView();
+});
+window.addEventListener('mouseup', () => { drag = null; vp.classList.remove('drag'); });
+
+vp.addEventListener('wheel', (e) => {
+  e.preventDefault();
+  const rect = vp.getBoundingClientRect();
+  const mx = e.clientX - rect.left, my = e.clientY - rect.top;
+  const factor = Math.exp(-e.deltaY * 0.0016);
+  const k2 = Math.min(3, Math.max(0.1, S.view.k * factor));
+  S.view.x = mx - (mx - S.view.x) * (k2 / S.view.k);
+  S.view.y = my - (my - S.view.y) * (k2 / S.view.k);
+  S.view.k = k2; applyView();
+}, { passive: false });
+
+$('zin').onclick = () => { zoomBy(1.25); };
+$('zout').onclick = () => { zoomBy(0.8); };
+$('zfit').onclick = () => fit();
+function zoomBy(f) {
+  const rect = vp.getBoundingClientRect();
+  const mx = rect.width / 2, my = rect.height / 2;
+  const k2 = Math.min(3, Math.max(0.1, S.view.k * f));
+  S.view.x = mx - (mx - S.view.x) * (k2 / S.view.k);
+  S.view.y = my - (my - S.view.y) * (k2 / S.view.k);
+  S.view.k = k2; applyView();
+}
+
+$('btnRefresh').onclick = () => loadModel();
+$('btnLive').onclick = () => {
+  S.auto = !S.auto;
+  $('btnLive').classList.toggle('on', S.auto);
+  $('btnLive').textContent = S.auto ? '自动刷新 2min' : '已暂停刷新';
+  startTimer();
+};
+function startTimer() {
+  if (S.timer) clearInterval(S.timer);
+  if (S.auto) S.timer = setInterval(() => loadModel().catch(() => {}), INTERVAL_MS);
+}
+
+function flashChanged() {
+  // 数据变化时给左列卡片一个高亮闪烁（视觉上确认「live」）
+  requestAnimationFrame(() => {
+    document.querySelectorAll('.card').forEach((c) => { c.classList.add('flash'); setTimeout(() => c.classList.remove('flash'), 1700); });
+  });
+}
+
+/* ============================== 启动 ============================== */
+$('btnLive').classList.add('on');
+loadModel().then(() => { fit(); startTimer(); }).catch((e) => {
+  $('list').innerHTML = `<div class="empty">读取失败：${esc(e.message)}<br><br>检查插件配置 <span class="kbd">treeRoot</span> 是否指向含 <span class="kbd">.fgs/projects</span> 的目录</div>`;
+});
+</script>
+</body>
+</html>

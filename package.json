@@ -1,0 +1,52 @@
+{
+  "name": "@local/fgs-v5-dsh",
+  "version": "1.3.0",
+  "private": true,
+  "type": "module",
+  "description": "FGS blackboard (Fact -> Step -> Fact) for DeepSeek-Harness: single-writer controller, activity runs (fresh Decide/Execute per process), FLAG verify gate.",
+  "icon": "./icon.svg",
+  "meta": {
+    "title": "FGS 黑板 v5（活动 run）",
+    "description": "事实→步骤→新事实的黑板 v5：单写者 Controller、一次性 Decide/Execute 活动 run、注册期工具隔离、FLAG 硬门与 reopen。"
+  },
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./package.json": "./package.json",
+    "./locale/*.json": "./locale/*.json"
+  },
+  "files": [
+    "cordis.patch.yml",
+    "index.js",
+    "client.js",
+    "yaml.js",
+    "controller",
+    "hooks",
+    "env",
+    "fixtures",
+    "io-specs",
+    "schemas",
+    "prompts",
+    "locale",
+    "tools",
+    "contest",
+    "icon.svg",
+    "CONTRACT.md",
+    "README.md",
+    "docs",
+    "tree.js",
+    "tree.html"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-conversation"
+      ]
+    }
+  }
+}

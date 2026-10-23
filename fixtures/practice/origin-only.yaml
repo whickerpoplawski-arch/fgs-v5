@@ -1,0 +1,15 @@
+facts:
+- id: fact_origin
+  title: "题目信息:"
+  createdAt: 2026-10-14T12:00:00.000Z
+  content: |-
+    {
+      "unique_code": "practice-boot",
+      "done_when": "一条事实的正文含 flag{practice-boot}"
+    }
+goals:
+- id: goal_final
+  kind: final
+  criterion: 一条事实的正文含 flag{practice-boot}，即满足 goal_final
+  createdAt: 2026-10-14T12:00:00.000Z
+steps: []

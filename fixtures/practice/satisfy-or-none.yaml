@@ -1,0 +1,43 @@
+facts:
+- id: fact_origin
+  title: "题目信息:"
+  createdAt: 2026-10-14T12:00:00.000Z
+  content: |-
+    {
+      "unique_code": "practice-or-none",
+      "done_when": "至少一条被引用的事实含有效标记"
+    }
+- id: fact_001
+  title: "不含标记的事实甲"
+  createdAt: 2026-10-14T12:05:00.000Z
+  producedBy: step_001
+  content: "过程笔记甲：这里没有标记。"
+- id: fact_002
+  title: "不含标记的事实乙"
+  createdAt: 2026-10-14T12:06:00.000Z
+  producedBy: step_002
+  content: "过程笔记乙：这里也没有标记。"
+goals:
+- id: goal_final
+  kind: final
+  criterion: 至少一条被引用的事实含有效标记 flag{...}
+  createdAt: 2026-10-14T12:00:00.000Z
+steps:
+- id: step_001
+  action: 记录过程笔记甲
+  from:
+  - fact_origin
+  actor: agent
+  priority: normal
+  state: done
+  createdAt: 2026-10-14T12:04:00.000Z
+  to: fact_001
+- id: step_002
+  action: 记录过程笔记乙
+  from:
+  - fact_origin
+  actor: agent
+  priority: normal
+  state: done
+  createdAt: 2026-10-14T12:04:30.000Z
+  to: fact_002
